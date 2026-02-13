@@ -1,5 +1,5 @@
 {
-  "name": "ample-sms-webhook",
-  "version": "1.0.0",
-  "private": true
+  "dependencies": {
+    "twilio": "^4.0.0"
+  }
 }
