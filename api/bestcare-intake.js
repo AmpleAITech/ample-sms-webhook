@@ -1,8 +1,3 @@
-// api/bestcare-intake.js
-// Receives intake JSON (from Twilio Studio + other demo sources), normalizes it,
-// parses SMS "Name, reason" into columns, applies placeholder email,
-// then forwards to Google Apps Script to append into Google Sheets.
-
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ ok: false, error: "Method not allowed" });
@@ -11,7 +6,10 @@ export default async function handler(req, res) {
   try {
     const sheetsUrl = process.env.BESTCARE_SHEETS_WEBHOOK_URL;
     if (!sheetsUrl) {
-      return res.status(500).json({ ok: false, error: "Missing BESTCARE_SHEETS_WEBHOOK_URL" });
+      return res.status(500).json({
+        ok: false,
+        error: "Missing BESTCARE_SHEETS_WEBHOOK_URL",
+      });
     }
 
     const data = req.body || {};
@@ -37,7 +35,11 @@ export default async function handler(req, res) {
       if (s.includes(",")) {
         const match = s.match(/^([^,]+),\s*(.+)$/);
         if (!match) return null;
-        return { namePart: normalizeStr(match[1]), reasonPart: normalizeStr(match[2]), raw: detailsRaw };
+        return {
+          namePart: normalizeStr(match[1]),
+          reasonPart: normalizeStr(match[2]),
+          raw: detailsRaw,
+        };
       }
 
       // Fallback split: "Name - reason"
@@ -47,7 +49,7 @@ export default async function handler(req, res) {
           return {
             namePart: normalizeStr(parts[0]),
             reasonPart: normalizeStr(parts.slice(1).join(" - ")),
-            raw: detailsRaw
+            raw: detailsRaw,
           };
         }
       }
@@ -75,7 +77,7 @@ export default async function handler(req, res) {
       urgent_flag: normalizeStr(data.urgent_flag) || "no",
       notes: normalizeStr(data.notes),
       call_sid: normalizeStr(data.call_sid),
-      recording_url: normalizeStr(data.recording_url)
+      recording_url: normalizeStr(data.recording_url),
     };
 
     // ---------- Bulletproof normalization (scenario + consent) ----------
@@ -85,43 +87,76 @@ export default async function handler(req, res) {
 
       const scenarioMap = {
         // voice / generic
-        "new_patient": "telephone_request",
+        new_patient: "telephone_request",
         "new patient": "telephone_request",
-        "telephone_appointment_request": "telephone_request",
+        telephone_appointment_request: "telephone_request",
         "telephone appointment request": "telephone_request",
-        "appointment_request": "telephone_request",
+        appointment_request: "telephone_request",
         "appointment request": "telephone_request",
-        "telephone_request": "telephone_request",
+        telephone_request: "telephone_request",
 
-        "reschedule": "reschedule_request",
-        "reschedule_request": "reschedule_request",
-        "change_appointment": "reschedule_request",
+        reschedule: "reschedule_request",
+        reschedule_request: "reschedule_request",
+        change_appointment: "reschedule_request",
         "change appointment": "reschedule_request",
-        "cancel": "reschedule_request",
-        "cancel_request": "reschedule_request",
+        cancel: "reschedule_request",
+        cancel_request: "reschedule_request",
 
         // sms
-        "missed_call": "missed_call_sms",
+        missed_call: "missed_call_sms",
         "missed call": "missed_call_sms",
-        "missed_call_sms": "missed_call_sms"
+        missed_call_sms: "missed_call_sms",
+        missed_call_menu: "missed_call_sms",
       };
 
       intake.scenario =
-        scenarioMap[sc] ||
-        (sc || (src === "sms" ? "missed_call_sms" : "telephone_request"));
+        scenarioMap[sc] || (sc || (src === "sms" ? "missed_call_sms" : "telephone_request"));
 
-      // ✅ Consent normalization (including sms_opt_in_assumed -> sms_yes)
+      // Consent normalization
       const c = String(intake.consent || "").trim().toLowerCase();
 
-      if (c === "sms_opt_in_assumed") intake.consent = "sms_yes";
-      else if (c === "sms_yes") intake.consent = "sms_yes";
-      else if (c === "sms_no") intake.consent = "sms_no";
-      else if (c === "verbal_yes") intake.consent = "verbal_yes";
-      else if (c === "verbal_no") intake.consent = "verbal_no";
-      else if (c === "yes" || c === "y" || c === "true") intake.consent = "verbal_yes";
+      // normalize old values
+      if (c === "yes" || c === "y" || c === "true") intake.consent = "verbal_yes";
       else if (c === "no" || c === "n" || c === "false") intake.consent = "verbal_no";
-      // otherwise keep as-is
+      else if (c === "sms_opt_in_assumed") intake.consent = "sms_yes";
+
+      // default consent for demo clarity
+      if (!String(intake.consent || "").trim()) {
+        if (src === "sms") intake.consent = "sms_yes";
+        else intake.consent = "verbal_yes";
+      }
     })(intake);
+
+    // ---------- Backfill notes for voice scenarios (telephone + reschedule) ----------
+    // This does NOT affect missed_call_sms.
+    (function backfillNotes(intake, raw) {
+      const sc = String(intake.scenario || "").toLowerCase();
+      if (String(intake.notes || "").trim()) return; // already has notes
+      if (sc !== "telephone_request" && sc !== "reschedule_request") return;
+
+      // pull from any likely fields Retell might send
+      const candidates = [
+        raw.preferred_time,
+        raw.preferred_window,
+        raw.preferred_day_time,
+        raw.requested_time,
+        raw.requested_window,
+        raw.new_time,
+        raw.new_time_window,
+        raw.new_day_time,
+        raw.time_window,
+        raw.when,
+        raw.callback_window,
+        raw.details,
+        raw.message,
+      ]
+        .map((v) => (v === null || v === undefined ? "" : String(v).trim()))
+        .filter(Boolean);
+
+      if (candidates.length) {
+        intake.notes = `Preferred time: ${candidates[0]}`;
+      }
+    })(intake, data);
 
     // ---------- SMS parsing for missed_call details ----------
     const source = normalizeStr(intake.source).toLowerCase();
@@ -146,12 +181,10 @@ export default async function handler(req, res) {
     }
 
     // ---------- Email placeholder (never ask for email) ----------
-    // If email is empty, silently set placeholder using last 4 digits of phone when possible
     if (!normalizeStr(intake.email)) {
       const digits = normalizeStr(intake.phone).replace(/\D/g, "");
-      const last4 = digits.length >= 4
-        ? digits.slice(-4)
-        : String(Math.floor(1000 + Math.random() * 9000));
+      const last4 =
+        digits.length >= 4 ? digits.slice(-4) : String(Math.floor(1000 + Math.random() * 9000));
       intake.email = `noemail+${last4}@ampledemo.com`;
     }
 
@@ -160,12 +193,16 @@ export default async function handler(req, res) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(intake),
-      redirect: "follow"
+      redirect: "follow",
     });
 
     const text = await forwardRes.text();
     let parsedResp;
-    try { parsedResp = JSON.parse(text); } catch { parsedResp = { raw: text }; }
+    try {
+      parsedResp = JSON.parse(text);
+    } catch {
+      parsedResp = { raw: text };
+    }
 
     // Demo-safe: always return 200
     return res.status(200).json({
@@ -173,9 +210,8 @@ export default async function handler(req, res) {
       sheets_ok: forwardRes.ok,
       sheets_status: forwardRes.status,
       sheets_response: parsedResp,
-      intake_preview: intake
+      intake_preview: intake,
     });
-
   } catch (err) {
     return res.status(200).json({ ok: true, sheets_ok: false, error: String(err) });
   }
