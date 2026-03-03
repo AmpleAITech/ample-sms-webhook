@@ -1,6 +1,6 @@
 // api/retell-events.js
-// Receives Retell webhook events.
-// If call ended quickly (<= 6s), send "Sorry we missed you..." SMS via Twilio.
+// Retell webhook -> send missed-call SMS menu via Twilio
+// DEMO-SAFE: send SMS on any "call ended" event (no duration filtering yet)
 
 import twilio from "twilio";
 
@@ -10,33 +10,34 @@ export default async function handler(req, res) {
   try {
     const event = req.body || {};
 
-    // --- You may need to adjust these field names based on Retell's payload ---
-    // We'll handle several likely shapes to be safe.
-    const type = String(event.event || event.type || "").toLowerCase();
-
-    // Pull call info from common locations
-    const call = event.call || event.data || event;
-    const from = call.from_number || call.from || call.caller_number || call.phone_number || "";
-    const duration =
-      Number(call.duration_seconds ?? call.duration ?? call.call_duration ?? 0);
-
-    // Only act on call end/completed events (defensive)
-    const looksLikeCallEnd =
-      type.includes("call") && (type.includes("end") || type.includes("completed") || type.includes("finish")) ||
-      Boolean(call.duration_seconds ?? call.call_duration ?? call.duration);
-
-    if (!looksLikeCallEnd) return res.status(200).json({ ok: true, ignored: "not_call_end" });
-
-    // Simulated missed call: ended quickly
-    if (!(duration > 0 && duration <= 6)) {
-      return res.status(200).json({ ok: true, ignored: "duration_not_missed", duration });
+    // --- Only act on call-ended events ---
+    const eventType = String(event.event || event.type || "").toLowerCase();
+    const isCallEnded = eventType.includes("call") && eventType.includes("end");
+    if (!isCallEnded) {
+      return res.status(200).json({ ok: true, ignored: "not_call_ended", eventType });
     }
 
-    if (!from) return res.status(200).json({ ok: true, ignored: "missing_from" });
+    // --- Extract caller number from multiple possible locations ---
+    const call = event.call || event.data || event.payload || event;
 
+    const from =
+      call.from_number ||
+      call.from ||
+      call.caller_number ||
+      call.caller ||
+      call.phone_number ||
+      event.from_number ||
+      event.from ||
+      "";
+
+    if (!from) {
+      return res.status(200).json({ ok: true, ignored: "missing_from" });
+    }
+
+    // --- Twilio creds ---
     const accountSid = process.env.TWILIO_ACCOUNT_SID;
     const authToken = process.env.TWILIO_AUTH_TOKEN;
-    const fromSms = process.env.TWILIO_FROM_NUMBER; // should be +14313405041
+    const fromSms = process.env.TWILIO_FROM_NUMBER; // MUST be +14313405041
 
     if (!accountSid || !authToken || !fromSms) {
       return res.status(500).json({ ok: false, error: "Missing Twilio env vars" });
@@ -57,7 +58,7 @@ export default async function handler(req, res) {
       body: menuText
     });
 
-    // Optional: log to sheet that menu SMS was sent
+    // Optional: log to sheet that menu was sent (nice for demo)
     try {
       await fetch("https://ample-sms-webhook-demov1.vercel.app/api/bestcare-intake", {
         method: "POST",
@@ -66,18 +67,17 @@ export default async function handler(req, res) {
           source: "phone",
           scenario: "missed_call",
           phone: from,
-          reason_for_appointment: "Simulated missed call (quick hangup) — auto SMS menu sent",
+          reason_for_appointment: "Retell call ended — auto SMS menu sent",
           consent: "n/a",
           urgent_flag: "no",
-          notes: `Retell duration=${duration}`,
+          notes: `Retell eventType=${eventType}`,
           call_sid: call.call_id || call.id || ""
         })
       });
     } catch (_) {}
 
-    return res.status(200).json({ ok: true, sms_sent: true, duration });
+    return res.status(200).json({ ok: true, sms_sent: true });
   } catch (err) {
-    // Demo-safe: always return 200 so Retell doesn't retry endlessly
     return res.status(200).json({ ok: true, error: String(err) });
   }
 }
