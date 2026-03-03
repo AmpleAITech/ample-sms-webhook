@@ -1,3 +1,16 @@
+// api/retell-events.js
+// FINAL (demo-safe) missed-call SMS trigger with dedupe via Apps Script (GET)
+// - Triggers on ended call + quick user hangup (<=6s)
+// - Calls Apps Script dedupe (by call_id). If dedupe says duplicate -> skip.
+// - FAIL-OPEN: if dedupe errors/returns HTML/slow, we still send SMS so demo never breaks.
+// - Logs raw dedupe response so you can debug from Vercel logs.
+//
+// Required Vercel env vars:
+// - TWILIO_ACCOUNT_SID
+// - TWILIO_AUTH_TOKEN
+// - TWILIO_FROM_NUMBER = +14313405041
+// - BESTCARE_DEDUPE_WEBHOOK_URL = https://script.google.com/macros/s/<NEW_DEPLOYMENT_ID>/exec
+
 import twilio from "twilio";
 
 export default async function handler(req, res) {
@@ -37,24 +50,60 @@ export default async function handler(req, res) {
       });
     }
 
-    if (!callId) return res.status(200).json({ ok: true, ignored: "missing_call_id" });
     if (!from) return res.status(200).json({ ok: true, ignored: "missing_from_number" });
+    if (!callId) return res.status(200).json({ ok: true, ignored: "missing_call_id" });
 
-    // ✅ DEDUPE (GET) - prevents double menu SMS across parallel serverless instances
+    // -------- DEDUPE (GET) - FAIL OPEN --------
     const dedupeBase = process.env.BESTCARE_DEDUPE_WEBHOOK_URL;
     if (!dedupeBase) {
-      return res.status(500).json({ ok: false, error: "Missing BESTCARE_DEDUPE_WEBHOOK_URL" });
+      return res
+        .status(500)
+        .json({ ok: false, error: "Missing BESTCARE_DEDUPE_WEBHOOK_URL" });
     }
 
     const dedupeUrl = `${dedupeBase}?action=dedupe_menu&call_id=${encodeURIComponent(callId)}`;
-    const dedupeResp = await fetch(dedupeUrl, { method: "GET" });
-    const dedupeJson = await dedupeResp.json().catch(() => ({}));
 
-    if (!dedupeJson.allow) {
-      return res.status(200).json({ ok: true, ignored: "deduped", reason: dedupeJson.reason || "duplicate" });
+    // Fail-open so demo never breaks
+    let dedupeAllow = true;
+
+    try {
+      // Optional timeout (keeps handler fast)
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 1500);
+
+      const dedupeResp = await fetch(dedupeUrl, {
+        method: "GET",
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeout);
+
+      const raw = await dedupeResp.text();
+      console.log("DEDUPE_STATUS", dedupeResp.status);
+      console.log("DEDUPE_RAW", raw.slice(0, 1000));
+
+      // If it returns JSON, respect allow/duplicate
+      try {
+        const parsed = JSON.parse(raw);
+        dedupeAllow = !!parsed.allow;
+
+        if (!dedupeAllow) {
+          return res.status(200).json({
+            ok: true,
+            ignored: "deduped",
+            reason: parsed.reason || "duplicate",
+          });
+        }
+      } catch (_) {
+        // Not JSON -> fail open
+        dedupeAllow = true;
+      }
+    } catch (e) {
+      console.log("DEDUPE_ERROR", String(e));
+      dedupeAllow = true; // fail open
     }
 
-    // Send menu SMS via Twilio
+    // -------- SEND MENU SMS --------
     const accountSid = process.env.TWILIO_ACCOUNT_SID;
     const authToken = process.env.TWILIO_AUTH_TOKEN;
     const fromSms = process.env.TWILIO_FROM_NUMBER; // +14313405041
@@ -78,7 +127,7 @@ export default async function handler(req, res) {
       body: menuText,
     });
 
-    // Optional: log menu-sent to your Google Sheet
+    // Optional: log menu-sent to sheet (non-blocking)
     try {
       await fetch("https://ample-sms-webhook-demov1.vercel.app/api/bestcare-intake", {
         method: "POST",
@@ -90,15 +139,23 @@ export default async function handler(req, res) {
           reason_for_appointment: "Simulated missed call (quick hangup) — auto SMS menu sent",
           consent: "n/a",
           urgent_flag: "no",
-          notes: `call_id=${callId} duration=${durationSeconds}s`,
+          notes: `call_id=${callId} duration=${durationSeconds}s dedupeAllow=${dedupeAllow}`,
           call_sid: call?.telephony_identifier?.twilio_call_sid || "",
           recording_url: call?.recording_url || "",
         }),
       });
     } catch (_) {}
 
-    return res.status(200).json({ ok: true, sms_sent: true, to: from, callId, durationSeconds });
+    return res.status(200).json({
+      ok: true,
+      sms_sent: true,
+      to: from,
+      callId,
+      durationSeconds,
+      dedupeAllow,
+    });
   } catch (err) {
+    // demo-safe: never cause webhook retries
     return res.status(200).json({ ok: true, error: String(err) });
   }
 }
