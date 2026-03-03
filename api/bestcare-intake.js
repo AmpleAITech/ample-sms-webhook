@@ -73,6 +73,41 @@ export default async function handler(req, res) {
       recording_url: normalizeStr(data.recording_url)
     };
 
+    // ---------- Bulletproof normalization (scenario + consent) ----------
+    (function normalize(intake) {
+      const src = String(intake.source || "").trim().toLowerCase();
+      const sc = String(intake.scenario || "").trim().toLowerCase();
+
+      const scenarioMap = {
+        // voice / generic
+        "new_patient": "telephone_request",
+        "new patient": "telephone_request",
+        "telephone_appointment_request": "telephone_request",
+        "telephone appointment request": "telephone_request",
+        "appointment_request": "telephone_request",
+        "appointment request": "telephone_request",
+        "telephone_request": "telephone_request",
+
+        "reschedule": "reschedule_request",
+        "reschedule_request": "reschedule_request",
+        "change_appointment": "reschedule_request",
+        "change appointment": "reschedule_request",
+        "cancel": "reschedule_request",
+        "cancel_request": "reschedule_request",
+
+        // sms
+        "missed_call": "missed_call_sms",
+        "missed call": "missed_call_sms",
+        "missed_call_sms": "missed_call_sms"
+      };
+
+      intake.scenario = scenarioMap[sc] || (sc || (src === "sms" ? "missed_call_sms" : "telephone_request"));
+
+      const c = String(intake.consent || "").trim().toLowerCase();
+      if (c === "yes" || c === "y" || c === "true") intake.consent = "verbal_yes";
+      else if (c === "no" || c === "n" || c === "false") intake.consent = "verbal_no";
+    })(intake);
+
     // ---------- SMS parsing for missed_call details ----------
     const source = normalizeStr(intake.source).toLowerCase();
     const scenario = normalizeStr(intake.scenario).toLowerCase();
@@ -80,7 +115,8 @@ export default async function handler(req, res) {
     const firstEmpty = !normalizeStr(intake.first_name);
     const lastEmpty = !normalizeStr(intake.last_name);
 
-    if (source === "sms" && scenario === "missed_call" && firstEmpty && lastEmpty) {
+    // We normalize to "missed_call_sms" now
+    if (source === "sms" && scenario === "missed_call_sms" && firstEmpty && lastEmpty) {
       const parsed = parseNameReasonFromSms(intake.reason_for_appointment);
       if (parsed) {
         const { first, last } = splitName(parsed.namePart);
@@ -92,6 +128,14 @@ export default async function handler(req, res) {
 
         ensureNotes(intake, `raw_sms="${normalizeStr(parsed.raw)}"`);
       }
+    }
+
+    // ---------- Email placeholder (never ask for email) ----------
+    // If email is empty, silently set placeholder using last 4 digits of phone when possible
+    if (!normalizeStr(intake.email)) {
+      const digits = normalizeStr(intake.phone).replace(/\D/g, "");
+      const last4 = digits.length >= 4 ? digits.slice(-4) : String(Math.floor(1000 + Math.random() * 9000));
+      intake.email = `noemail+${last4}@ampledemo.com`;
     }
 
     // ---------- Forward to Apps Script (append row) ----------
