@@ -1,9 +1,11 @@
 // api/retell-events.js
-// TEMP "works no matter what" version:
-// - Only processes call_ended (avoids duplicates)
-// - Sends the menu SMS to the caller if we can extract their number
-// - If caller number is missing, falls back to DEBUG_TO_NUMBER (so you can still demo)
-// - NO duration filter yet (we'll add back once we confirm Retell duration field)
+// PURPOSE: Retell webhook -> send missed-call SMS menu via Twilio
+// CURRENT: Debug-friendly version that logs the full Retell call object so we can
+// reliably extract the caller phone number (no guessing).
+//
+// After you paste this, do ONE real call (call 236... hang up) then copy the
+// "RETELL_CALL {...}" line from Vercel logs and send it to me.
+// Then we'll lock the correct `from` field and remove any debug fallback.
 
 import twilio from "twilio";
 
@@ -14,14 +16,17 @@ export default async function handler(req, res) {
     const event = req.body || {};
     const eventType = String(event.event || event.type || "").toLowerCase();
 
-    // Only act on call_ended to prevent multiple sends
+    // Only process call end events to avoid multiple SMS sends
     if (eventType !== "call_ended") {
       return res.status(200).json({ ok: true, ignored: eventType });
     }
 
     const call = event.call || event.data || event.payload || event;
 
-    // Try to find caller number across common keys
+    // ✅ Key debug line: prints the whole call object
+    console.log("RETELL_CALL", JSON.stringify(event.call || call));
+
+    // Best-effort caller extraction (will be corrected once we see RETELL_CALL)
     const from =
       call?.from_number ||
       call?.from ||
@@ -34,17 +39,21 @@ export default async function handler(req, res) {
       event?.caller_number ||
       "";
 
-    // Fallback for demo/debug (set this env var)
-    const debugTo = process.env.DEBUG_TO_NUMBER || "";
-    const to = from || debugTo;
+    // Optional duration (may be missing depending on Retell event)
+    const duration = Number(
+      call?.duration_seconds ??
+      call?.duration ??
+      call?.call_duration ??
+      event?.duration_seconds ??
+      0
+    );
 
-    if (!to) {
-      return res.status(200).json({ ok: true, ignored: "no_to_number_found" });
-    }
+    // IMPORTANT: For now, don't rely on duration until we confirm the right field.
+    // We'll re-enable duration <= 6 after we know Retell's duration key.
 
     const accountSid = process.env.TWILIO_ACCOUNT_SID;
     const authToken = process.env.TWILIO_AUTH_TOKEN;
-    const fromSms = process.env.TWILIO_FROM_NUMBER; // +14313405041
+    const fromSms = process.env.TWILIO_FROM_NUMBER; // MUST be +14313405041
 
     if (!accountSid || !authToken || !fromSms) {
       return res.status(500).json({ ok: false, error: "Missing Twilio env vars" });
@@ -59,33 +68,29 @@ export default async function handler(req, res) {
       "2 = Change an existing appointment\n" +
       "3 = Other";
 
+    // ✅ For debugging only:
+    // If caller number is missing, send to DEBUG_TO_NUMBER so you can verify the webhook fired.
+    // DO NOT use this for production/demo once we confirm the real caller field.
+    const debugTo = process.env.DEBUG_TO_NUMBER || "";
+    const to = from || debugTo;
+
+    if (!to) {
+      return res.status(200).json({ ok: true, ignored: "no_to_number_found" });
+    }
+
     await client.messages.create({
       from: fromSms,
       to,
-      body: menuText,
+      body: `${menuText}\n\n(debug: duration=${duration}s event=${eventType})`
     });
 
-    // Optional: log that menu SMS was sent (helps demo)
-    try {
-      await fetch("https://ample-sms-webhook-demov1.vercel.app/api/bestcare-intake", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          source: "phone",
-          scenario: "missed_call",
-          phone: to,
-          reason_for_appointment: "Retell call ended — auto SMS menu sent",
-          consent: "n/a",
-          urgent_flag: "no",
-          notes: `eventType=${eventType} | used_to=${to === from ? "caller" : "debug_fallback"}`,
-          call_sid: call?.call_id || call?.id || "",
-        }),
-      });
-    } catch (_) {}
-
-    return res.status(200).json({ ok: true, sms_sent: true, to_used: to, to_source: to === from ? "caller" : "debug" });
+    return res.status(200).json({
+      ok: true,
+      sms_sent: true,
+      to_source: to === from ? "caller" : "debug",
+      duration
+    });
   } catch (err) {
-    // demo-safe: always return 200 to avoid retries
     return res.status(200).json({ ok: true, error: String(err) });
   }
 }
