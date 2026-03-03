@@ -1,3 +1,10 @@
+// api/retell-events.js
+// TEMP "works no matter what" version:
+// - Only processes call_ended (avoids duplicates)
+// - Sends the menu SMS to the caller if we can extract their number
+// - If caller number is missing, falls back to DEBUG_TO_NUMBER (so you can still demo)
+// - NO duration filter yet (we'll add back once we confirm Retell duration field)
+
 import twilio from "twilio";
 
 export default async function handler(req, res) {
@@ -7,13 +14,14 @@ export default async function handler(req, res) {
     const event = req.body || {};
     const eventType = String(event.event || event.type || "").toLowerCase();
 
-    // Only act on call end/analyzed events (prevents duplicate sends)
-    const shouldProcess = eventType === "call_ended" || eventType === "call_analyzed";
-    if (!shouldProcess) return res.status(200).json({ ok: true, ignored: eventType });
+    // Only act on call_ended to prevent multiple sends
+    if (eventType !== "call_ended") {
+      return res.status(200).json({ ok: true, ignored: eventType });
+    }
 
     const call = event.call || event.data || event.payload || event;
 
-    // Caller number
+    // Try to find caller number across common keys
     const from =
       call?.from_number ||
       call?.from ||
@@ -23,23 +31,16 @@ export default async function handler(req, res) {
       call?.customer_number ||
       event?.from_number ||
       event?.from ||
+      event?.caller_number ||
       "";
 
-    // Duration (Retell may use different keys; we try several)
-    const duration = Number(
-      call?.duration_seconds ??
-      call?.duration ??
-      call?.call_duration ??
-      event?.duration_seconds ??
-      0
-    );
+    // Fallback for demo/debug (set this env var)
+    const debugTo = process.env.DEBUG_TO_NUMBER || "";
+    const to = from || debugTo;
 
-    // Simulated missed call: short calls only
-    if (!(duration > 0 && duration <= 6)) {
-      return res.status(200).json({ ok: true, ignored: "duration_not_missed", duration });
+    if (!to) {
+      return res.status(200).json({ ok: true, ignored: "no_to_number_found" });
     }
-
-    if (!from) return res.status(200).json({ ok: true, ignored: "missing_from" });
 
     const accountSid = process.env.TWILIO_ACCOUNT_SID;
     const authToken = process.env.TWILIO_AUTH_TOKEN;
@@ -60,13 +61,31 @@ export default async function handler(req, res) {
 
     await client.messages.create({
       from: fromSms,
-      to: from,
-      body: menuText
+      to,
+      body: menuText,
     });
 
-    return res.status(200).json({ ok: true, sms_sent: true, duration, eventType });
+    // Optional: log that menu SMS was sent (helps demo)
+    try {
+      await fetch("https://ample-sms-webhook-demov1.vercel.app/api/bestcare-intake", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source: "phone",
+          scenario: "missed_call",
+          phone: to,
+          reason_for_appointment: "Retell call ended — auto SMS menu sent",
+          consent: "n/a",
+          urgent_flag: "no",
+          notes: `eventType=${eventType} | used_to=${to === from ? "caller" : "debug_fallback"}`,
+          call_sid: call?.call_id || call?.id || "",
+        }),
+      });
+    } catch (_) {}
+
+    return res.status(200).json({ ok: true, sms_sent: true, to_used: to, to_source: to === from ? "caller" : "debug" });
   } catch (err) {
-    // demo-safe
+    // demo-safe: always return 200 to avoid retries
     return res.status(200).json({ ok: true, error: String(err) });
   }
 }
