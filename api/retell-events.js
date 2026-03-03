@@ -26,7 +26,7 @@ export default async function handler(req, res) {
     const isQuickHangup =
       disconnectionReason === "user_hangup" &&
       durationSeconds > 0 &&
-      durationSeconds <= 6;
+      durationSeconds <= 15;
 
     if (!isQuickHangup) {
       return res.status(200).json({
