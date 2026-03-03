@@ -1,6 +1,6 @@
 // api/retell-events.js
 // FINAL: Voice -> Sheets forwarding + Missed-call -> single menu SMS (deduped)
-// GUARANTEE: Missed-call behavior is unaffected because voice-forwarding is disabled when isQuickHangup=true.
+// Safety: Missed-call SMS logic is unchanged. Voice-forwarding is skipped when isQuickHangup=true.
 
 import twilio from "twilio";
 
@@ -40,7 +40,6 @@ export default async function handler(req, res) {
 
     // -----------------------------
     // Helper: safely pull extracted fields (Retell nesting can vary)
-    // We search deeply for these exact keys you created.
     // -----------------------------
     function findValueDeep(obj, key) {
       if (!obj || typeof obj !== "object") return "";
@@ -58,7 +57,7 @@ export default async function handler(req, res) {
       return "";
     }
 
-    // Extract fields (these match your Retell post-call extraction fields)
+    // Extract fields (match Retell post-call extraction field names)
     const extractedScenario = findValueDeep(call, "scenario") || findValueDeep(event, "scenario");
     const extractedFirst = findValueDeep(call, "first_name") || findValueDeep(event, "first_name");
     const extractedLast = findValueDeep(call, "last_name") || findValueDeep(event, "last_name");
@@ -71,6 +70,10 @@ export default async function handler(req, res) {
     const extractedUrgent =
       findValueDeep(call, "urgent_flag") || findValueDeep(event, "urgent_flag");
     const extractedNotes = findValueDeep(call, "notes") || findValueDeep(event, "notes");
+
+    // NEW: reschedule preferred time extraction (you add this in Retell)
+    const extractedPreferredTime =
+      findValueDeep(call, "preferred_time") || findValueDeep(event, "preferred_time");
 
     // Normalize voice scenario into your demo labels
     const scRaw = String(extractedScenario || "").trim().toLowerCase();
@@ -96,6 +99,20 @@ export default async function handler(req, res) {
     const isConversation = durationSeconds >= 8;
 
     if (!isQuickHangup && isConversation && normalizedVoiceScenario) {
+      // Build notes safely without breaking anything
+      let finalNotes = String(extractedNotes || "").trim();
+
+      // If reschedule, ensure we store the requested new time in notes
+      if (normalizedVoiceScenario === "reschedule_request") {
+        const pt = String(extractedPreferredTime || "").trim();
+        if (pt) {
+          finalNotes = finalNotes ? `${finalNotes} | Preferred new time: ${pt}` : `Preferred new time: ${pt}`;
+        } else if (!finalNotes) {
+          // demo-safe fallback (still logs scenario + reason even if extraction missed)
+          finalNotes = "";
+        }
+      }
+
       try {
         await fetch("https://ample-sms-webhook-demov1.vercel.app/api/bestcare-intake", {
           method: "POST",
@@ -109,9 +126,9 @@ export default async function handler(req, res) {
             email: "", // intake handler fills placeholder silently
             gender: "",
             reason_for_appointment: extractedReason,
-            consent: extractedConsent, // intake normalizes (sms_yes/verbal_yes etc)
+            consent: extractedConsent,
             urgent_flag: extractedUrgent || "no",
-            notes: extractedNotes,
+            notes: finalNotes,
             call_sid: callSid,
             recording_url: recordingUrl,
           }),
@@ -120,12 +137,12 @@ export default async function handler(req, res) {
         // demo-safe: ignore forwarding errors
       }
 
-      // If this was a normal voice call, we can stop here to avoid any SMS menu logic.
+      // Stop here so normal calls never fall into missed-call SMS logic
       return res.status(200).json({ ok: true, forwarded: true, scenario: normalizedVoiceScenario });
     }
 
     // -----------------------------
-    // (B) MISSED CALL → MENU SMS
+    // (B) MISSED CALL → MENU SMS (UNCHANGED)
     // -----------------------------
     if (!isQuickHangup) {
       return res.status(200).json({ ok: true, done: true });
