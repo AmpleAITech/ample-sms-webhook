@@ -1,16 +1,3 @@
-// api/retell-events.js
-// FINAL (demo-safe) missed-call SMS trigger with dedupe via Apps Script (GET)
-// - Triggers on ended call + quick user hangup (<=6s)
-// - Calls Apps Script dedupe (by call_id). If dedupe says duplicate -> skip.
-// - FAIL-OPEN: if dedupe errors/returns HTML/slow, we still send SMS so demo never breaks.
-// - Logs raw dedupe response so you can debug from Vercel logs.
-//
-// Required Vercel env vars:
-// - TWILIO_ACCOUNT_SID
-// - TWILIO_AUTH_TOKEN
-// - TWILIO_FROM_NUMBER = +14313405041
-// - BESTCARE_DEDUPE_WEBHOOK_URL = https://script.google.com/macros/s/<NEW_DEPLOYMENT_ID>/exec
-
 import twilio from "twilio";
 
 export default async function handler(req, res) {
@@ -56,9 +43,7 @@ export default async function handler(req, res) {
     // -------- DEDUPE (GET) - FAIL OPEN --------
     const dedupeBase = process.env.BESTCARE_DEDUPE_WEBHOOK_URL;
     if (!dedupeBase) {
-      return res
-        .status(500)
-        .json({ ok: false, error: "Missing BESTCARE_DEDUPE_WEBHOOK_URL" });
+      return res.status(500).json({ ok: false, error: "Missing BESTCARE_DEDUPE_WEBHOOK_URL" });
     }
 
     const dedupeUrl = `${dedupeBase}?action=dedupe_menu&call_id=${encodeURIComponent(callId)}`;
@@ -67,7 +52,6 @@ export default async function handler(req, res) {
     let dedupeAllow = true;
 
     try {
-      // Optional timeout (keeps handler fast)
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 1500);
 
@@ -79,8 +63,6 @@ export default async function handler(req, res) {
       clearTimeout(timeout);
 
       const raw = await dedupeResp.text();
-      console.log("DEDUPE_STATUS", dedupeResp.status);
-      console.log("DEDUPE_RAW", raw.slice(0, 1000));
 
       // If it returns JSON, respect allow/duplicate
       try {
@@ -98,8 +80,7 @@ export default async function handler(req, res) {
         // Not JSON -> fail open
         dedupeAllow = true;
       }
-    } catch (e) {
-      console.log("DEDUPE_ERROR", String(e));
+    } catch (_) {
       dedupeAllow = true; // fail open
     }
 
@@ -126,25 +107,6 @@ export default async function handler(req, res) {
       to: from,
       body: menuText,
     });
-
-    // Optional: log menu-sent to sheet (non-blocking)
-    try {
-      await fetch("https://ample-sms-webhook-demov1.vercel.app/api/bestcare-intake", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          source: "phone",
-          scenario: "missed_call",
-          phone: from,
-          reason_for_appointment: "Simulated missed call (quick hangup) — auto SMS menu sent",
-          consent: "n/a",
-          urgent_flag: "no",
-          notes: `call_id=${callId} duration=${durationSeconds}s dedupeAllow=${dedupeAllow}`,
-          call_sid: call?.telephony_identifier?.twilio_call_sid || "",
-          recording_url: call?.recording_url || "",
-        }),
-      });
-    } catch (_) {}
 
     return res.status(200).json({
       ok: true,
