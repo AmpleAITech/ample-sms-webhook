@@ -1,3 +1,8 @@
+// api/bestcare-intake.js
+// Receives intake JSON (from Twilio Studio + other demo sources), normalizes it,
+// parses SMS "Name, reason" into columns, applies placeholder email,
+// then forwards to Google Apps Script to append into Google Sheets.
+
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ ok: false, error: "Method not allowed" });
@@ -101,11 +106,21 @@ export default async function handler(req, res) {
         "missed_call_sms": "missed_call_sms"
       };
 
-      intake.scenario = scenarioMap[sc] || (sc || (src === "sms" ? "missed_call_sms" : "telephone_request"));
+      intake.scenario =
+        scenarioMap[sc] ||
+        (sc || (src === "sms" ? "missed_call_sms" : "telephone_request"));
 
+      // ✅ Consent normalization (including sms_opt_in_assumed -> sms_yes)
       const c = String(intake.consent || "").trim().toLowerCase();
-      if (c === "yes" || c === "y" || c === "true") intake.consent = "verbal_yes";
+
+      if (c === "sms_opt_in_assumed") intake.consent = "sms_yes";
+      else if (c === "sms_yes") intake.consent = "sms_yes";
+      else if (c === "sms_no") intake.consent = "sms_no";
+      else if (c === "verbal_yes") intake.consent = "verbal_yes";
+      else if (c === "verbal_no") intake.consent = "verbal_no";
+      else if (c === "yes" || c === "y" || c === "true") intake.consent = "verbal_yes";
       else if (c === "no" || c === "n" || c === "false") intake.consent = "verbal_no";
+      // otherwise keep as-is
     })(intake);
 
     // ---------- SMS parsing for missed_call details ----------
@@ -134,7 +149,9 @@ export default async function handler(req, res) {
     // If email is empty, silently set placeholder using last 4 digits of phone when possible
     if (!normalizeStr(intake.email)) {
       const digits = normalizeStr(intake.phone).replace(/\D/g, "");
-      const last4 = digits.length >= 4 ? digits.slice(-4) : String(Math.floor(1000 + Math.random() * 9000));
+      const last4 = digits.length >= 4
+        ? digits.slice(-4)
+        : String(Math.floor(1000 + Math.random() * 9000));
       intake.email = `noemail+${last4}@ampledemo.com`;
     }
 
