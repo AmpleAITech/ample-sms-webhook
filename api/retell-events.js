@@ -4,54 +4,52 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ ok: false });
 
   const event = req.body || {};
+  const call = event.call || event.data || event.payload || event;
 
-  // Log enough to see payload shape (first 1200 chars)
-  console.log("RETELL_EVENT", JSON.stringify(event).slice(0, 1200));
+  // Try to find caller number
+  const from =
+    call?.from_number ||
+    call?.from ||
+    call?.caller_number ||
+    call?.caller ||
+    call?.phone_number ||
+    call?.customer_number ||
+    event?.from_number ||
+    event?.from ||
+    event?.caller_number ||
+    "";
 
-  try {
-    const accountSid = process.env.TWILIO_ACCOUNT_SID;
-    const authToken = process.env.TWILIO_AUTH_TOKEN;
-    const fromSms = process.env.TWILIO_FROM_NUMBER; // +14313405041
+  // Try to find duration
+  const duration =
+    Number(call?.duration_seconds ?? call?.duration ?? call?.call_duration ?? event?.duration_seconds ?? 0);
 
-    if (!accountSid || !authToken || !fromSms) {
-      console.log("MISSING_TWILIO_ENV");
-      return res.status(500).json({ ok: false, error: "Missing Twilio env vars" });
-    }
+  const eventType = String(event.event || event.type || "").toLowerCase();
 
-    // Try hard to find a phone number in the payload
-    const call = event.call || event.data || event.payload || event;
-    const possible = [
-      call?.from_number,
-      call?.from,
-      call?.caller_number,
-      call?.caller,
-      call?.phone_number,
-      call?.customer_number,
-      event?.from_number,
-      event?.from,
-      event?.caller_number
-    ].filter(Boolean);
+  console.log("RETELL_EVENT_TYPE", eventType);
+  console.log("RETELL_FROM", from);
+  console.log("RETELL_DURATION", duration);
+  console.log("RETELL_KEYS", Object.keys(event));
 
-    // Fallback: send to YOUR phone for debug if Retell didn’t include From
-    const to = possible[0] || process.env.DEBUG_TO_NUMBER;
+  // Twilio env
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+  const fromSms = process.env.TWILIO_FROM_NUMBER;
+  const debugTo = process.env.DEBUG_TO_NUMBER;
 
-    if (!to) {
-      console.log("NO_TO_NUMBER_FOUND");
-      return res.status(200).json({ ok: true, ignored: "no_to_number" });
-    }
-
-    const client = twilio(accountSid, authToken);
-
-    await client.messages.create({
-      from: fromSms,
-      to,
-      body: "DEBUG: Retell webhook received. Reply 1/2/3 flow is active."
-    });
-
-    console.log("SENT_SMS_TO", to);
-    return res.status(200).json({ ok: true, sms_sent: true, to });
-  } catch (err) {
-    console.log("TWILIO_SEND_ERROR", String(err));
-    return res.status(200).json({ ok: true, error: String(err) });
+  if (!accountSid || !authToken || !fromSms) {
+    return res.status(500).json({ ok: false, error: "Missing Twilio env vars" });
   }
+
+  // For now, still send a debug SMS so you see it live
+  const to = from || debugTo;
+  if (!to) return res.status(200).json({ ok: true, ignored: "no_to" });
+
+  const client = twilio(accountSid, authToken);
+  await client.messages.create({
+    from: fromSms,
+    to,
+    body: `DEBUG parsed: duration=${duration}s. If duration<=6, we will send menu next.`
+  });
+
+  return res.status(200).json({ ok: true });
 }
