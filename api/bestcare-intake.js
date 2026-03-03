@@ -1,7 +1,3 @@
-// api/bestcare-intake.js
-// Receives intake JSON (from Retell or Twilio/Studio) and forwards to Apps Script to append a row.
-// Includes SMS parsing: "Full Name, reason" -> first_name/last_name/reason_for_appointment
-
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ ok: false, error: "Method not allowed" });
@@ -78,8 +74,6 @@ export default async function handler(req, res) {
     };
 
     // ---------- SMS parsing for missed_call details ----------
-    // Studio currently logs "Sarah Khan, prescription refill" into reason_for_appointment.
-    // If first/last are empty, extract them from the text.
     const source = normalizeStr(intake.source).toLowerCase();
     const scenario = normalizeStr(intake.scenario).toLowerCase();
 
