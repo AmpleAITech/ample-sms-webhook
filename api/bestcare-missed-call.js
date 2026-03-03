@@ -1,31 +1,31 @@
 // api/bestcare-missed-call.js
-// Triggered by Twilio Voice "Call status changes" webhook.
-// If call was not answered, send the missed-call SMS menu to the caller.
-// Also optionally log a "missed call auto-text sent" row to Google Sheet.
+// Twilio Voice "Call status changes" webhook
+// Sends missed-call SMS if:
+// - status is no-answer/busy/failed/canceled
+// OR
+// - call completed quickly (CallDuration <= 6 seconds) => "simulated missed call"
 
 import twilio from "twilio";
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).send("Method not allowed");
-  }
+  if (req.method !== "POST") return res.status(405).send("Method not allowed");
 
   try {
-    const {
-      CallStatus = "",
-      From = "",
-      CallSid = "",
-    } = req.body || {};
+    const body = req.body || {};
 
-    // Only act on missed-type statuses
-    const missedStatuses = new Set(["no-answer", "busy", "failed", "canceled"]);
-    if (!missedStatuses.has(String(CallStatus).toLowerCase())) {
+    const CallStatus = String(body.CallStatus || "").toLowerCase();
+    const From = String(body.From || "").trim();
+    const CallSid = String(body.CallSid || "").trim();
+    const CallDuration = Number(body.CallDuration || 0); // only present on completed
+
+    // Determine "missed" (real missed OR quick hangup)
+    const realMissed = ["no-answer", "busy", "failed", "canceled"].includes(CallStatus);
+    const quickHangup = (CallStatus === "completed" && CallDuration > 0 && CallDuration <= 6);
+
+    if (!realMissed && !quickHangup) {
       return res.status(200).send("ignored");
     }
-
-    if (!From) {
-      return res.status(200).send("missing From");
-    }
+    if (!From) return res.status(200).send("missing From");
 
     const accountSid = process.env.TWILIO_ACCOUNT_SID;
     const authToken = process.env.TWILIO_AUTH_TOKEN;
@@ -48,11 +48,10 @@ export default async function handler(req, res) {
     await client.messages.create({
       from: fromNumber,
       to: From,
-      body: menuText,
+      body: menuText
     });
 
-    // Optional: log to sheet that a missed call occurred + menu SMS sent
-    // This helps the demo look "complete" even before the patient replies.
+    // Optional: log the missed call + auto text sent (nice for demo)
     try {
       await fetch("https://ample-sms-webhook-demov1.vercel.app/api/bestcare-intake", {
         method: "POST",
@@ -60,23 +59,21 @@ export default async function handler(req, res) {
         body: JSON.stringify({
           source: "phone",
           scenario: "missed_call",
-          first_name: "",
-          last_name: "",
           phone: From,
-          email: "",
-          gender: "",
-          reason_for_appointment: "Missed call — auto SMS menu sent",
+          reason_for_appointment: quickHangup
+            ? "Missed call (simulated quick hangup) — auto SMS menu sent"
+            : "Missed call — auto SMS menu sent",
           consent: "n/a",
           urgent_flag: "no",
-          notes: `Twilio CallStatus=${CallStatus}`,
-          call_sid: CallSid,
-          recording_url: ""
-        }),
+          notes: `CallStatus=${CallStatus} CallDuration=${CallDuration}`,
+          call_sid: CallSid
+        })
       });
     } catch (_) {}
 
     return res.status(200).send("ok");
   } catch (err) {
-    return res.status(200).send("ok"); // demo-safe: never fail Twilio callback
+    // Demo-safe: do not cause Twilio retries
+    return res.status(200).send("ok");
   }
 }
