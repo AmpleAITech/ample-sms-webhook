@@ -3,7 +3,8 @@
 // Handles:
 // - YES/NO confirmation replies
 // - Menu replies 1/2/3
-// - Details-only replies after prompting (demo-safe, stateless)
+// - Details-only replies after prompting (stateless, demo-safe)
+// Enforces consistent SMS formatting + clinic footer.
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method not allowed");
@@ -14,34 +15,41 @@ export default async function handler(req, res) {
     const msgRaw = String(body.Body || "").trim();
 
     const clinicName = process.env.CLINIC_NAME || "Huron Dental Centre";
-    const clinicPhone = process.env.CLINIC_PHONE || process.env.TWILIO_FROM_NUMBER || "";
+    const clinicPhone = process.env.CLINIC_PHONE || "855-393-0900";
     const bookingLink = process.env.CAL_BOOKING_LINK || "";
     const noticeHours = Number(process.env.RESCHEDULE_NOTICE_HOURS || 48);
 
-    if (!from) return twiml(res, "Sorry — missing phone number. Please try again.");
-    if (!msgRaw) return twiml(res, menuText(clinicName, noticeHours));
+    if (!from) return twiml(res, `Sorry — missing phone number.\n\n${footer(clinicName, clinicPhone)}`);
+    if (!msgRaw) return twiml(res, menuText(clinicName, clinicPhone, noticeHours));
 
+    // -----------------------------
     // (A) YES / NO confirmations
+    // -----------------------------
     const yn = normalizeYesNo(msgRaw);
     if (yn === "YES") {
       return twiml(
         res,
-        `Thank you for confirming your presence. We look forward to seeing you.\n${clinicName}\nT - ${clinicPhone}`
+        `Thanks for confirming.\nWe look forward to seeing you.\n\n${footer(clinicName, clinicPhone)}`
       );
     }
     if (yn === "NO") {
       return twiml(
         res,
-        `No problem — we’ve noted you can’t make it. Please reply here or call T - ${clinicPhone} to reschedule.\n${clinicName}`
+        `No problem — we’ve noted you can’t make it.\nPlease reply here or call to reschedule.\n\n${footer(
+          clinicName,
+          clinicPhone
+        )}`
       );
     }
 
-    // (B) Menu replies 1/2/3
+    // -----------------------------
+    // (B) Menu replies 1 / 2 / 3
+    // -----------------------------
     const parsed = parseMenuReply(msgRaw);
 
     // Details-only fallback (after we prompted for details)
     if (!parsed) {
-      return twiml(res, "Thanks. Got it. We’ll confirm shortly.");
+      return twiml(res, `Thanks. Got it. We’ll confirm shortly.\n\n${footer(clinicName, clinicPhone)}`);
     }
 
     const { choice, details } = parsed;
@@ -49,67 +57,69 @@ export default async function handler(req, res) {
     // If no details, prompt for details based on choice
     if (!details) {
       if (choice === "1") {
-        const linkLine = bookingLink ? `\nOr book here: ${bookingLink}` : "";
+        const linkLine = bookingLink ? `\n\nOr book here:\n${bookingLink}` : "";
         return twiml(
           res,
-          `Got it — ${clinicName} (Mississauga).\n` +
-            `Please reply with: Full name + preferred day/time.\n` +
-            `Example: "Sarah Khan, next Tue after 3pm".\n` +
-            `You can also call T - ${clinicPhone}.` +
-            linkLine
+          `Please reply with: Full name + preferred day/time.\n\n` +
+            `Example: "Sarah Khan, next Tue after 3pm".` +
+            linkLine +
+            `\n\n${footer(clinicName, clinicPhone)}`
         );
       }
 
       if (choice === "2") {
+        // EXACT format user requested
         return twiml(
           res,
-          `Sure — ${clinicName} (Mississauga).\n` +
-            `Reminder: we ask for ${noticeHours} hours notice for reschedules.\n` +
-            `Please reply with: Full name + current appt day/time + preferred new time.\n` +
-            `Example: "Sarah Khan, current Thu 2pm, want Fri morning".\n` +
-            `You can also call T - ${clinicPhone}.`
+          `Reminder: we ask for ${noticeHours} hours notice for reschedules.\n\n` +
+            `Please reply with: Full name + current appt day/time + preferred new time.\n\n` +
+            `Example: "Sarah Khan, current Thu 2pm, want Fri morning".\n\n` +
+            `${footer(clinicName, clinicPhone)}`
         );
       }
 
+      // choice === "3"
       return twiml(
         res,
-        `No problem — ${clinicName} (Mississauga).\n` +
-          `Please reply with: Full name + how we can help.\n` +
-          `Example: "Sarah Khan, question about insurance".\n` +
-          `You can also call T - ${clinicPhone}.`
+        `Please reply with: Full name + how we can help.\n\n` +
+          `Example: "Sarah Khan, question about insurance".\n\n` +
+          `${footer(clinicName, clinicPhone)}`
       );
     }
 
     // They included details in the same message -> acknowledge
     if (choice === "1") {
-      const linkLine = bookingLink ? `\nOptional booking link: ${bookingLink}` : "";
+      const linkLine = bookingLink ? `\n\nOptional booking link:\n${bookingLink}` : "";
       return twiml(
         res,
-        `Thanks — got it. ${clinicName} (Mississauga) will confirm shortly by text or call.` + linkLine
+        `Thanks. Got it. We’ll confirm shortly.` + linkLine + `\n\n${footer(clinicName, clinicPhone)}`
       );
     }
 
     if (choice === "2") {
       return twiml(
         res,
-        `Thanks — got it. ${clinicName} (Mississauga) will confirm shortly.\n` +
-          `Reminder: we ask for ${noticeHours} hours notice for reschedules.`
+        `Thanks. Got it. We’ll confirm shortly.\n\n${footer(clinicName, clinicPhone)}`
       );
     }
 
-    return twiml(res, `Thanks — got it. ${clinicName} (Mississauga) will follow up shortly.`);
+    // choice === "3"
+    return twiml(res, `Thanks. Got it. We’ll confirm shortly.\n\n${footer(clinicName, clinicPhone)}`);
   } catch (_) {
-    return twiml(res, "Thanks — we received your message. If this is an emergency, please call 911.");
+    const clinicName = process.env.CLINIC_NAME || "Huron Dental Centre";
+    const clinicPhone = process.env.CLINIC_PHONE || "855-393-0900";
+    return twiml(res, `Thanks — we received your message.\n\n${footer(clinicName, clinicPhone)}`);
   }
 }
 
-function menuText(clinicName, noticeHours) {
+function menuText(clinicName, clinicPhone, noticeHours) {
   return (
-    `Sorry we missed you at ${clinicName}.\n` +
+    `Sorry we missed you.\n\n` +
     `Reply:\n` +
     `1 = Book new patient exam\n` +
     `2 = Reschedule / change appointment (${noticeHours}h notice)\n` +
-    `3 = Other`
+    `3 = Other\n\n` +
+    `${footer(clinicName, clinicPhone)}`
   );
 }
 
@@ -120,7 +130,6 @@ function parseMenuReply(msg) {
 
   const prefixRegex = new RegExp(`^\\s*${firstChar}\\s*([\\-:])?\\s*`, "i");
   const details = s.replace(prefixRegex, "").trim();
-
   return { choice: firstChar, details: details || "" };
 }
 
@@ -129,6 +138,10 @@ function normalizeYesNo(msg) {
   if (s === "yes" || s === "y") return "YES";
   if (s === "no" || s === "n") return "NO";
   return "";
+}
+
+function footer(clinicName, clinicPhone) {
+  return `${clinicName},\nT - ${clinicPhone}`;
 }
 
 function twiml(res, message) {
