@@ -1,13 +1,9 @@
 // api/bestcare-sms.js
-// Twilio inbound SMS webhook (POST, x-www-form-urlencoded)
-//
-// Supports BOTH:
-// 1) YES/NO booking confirmations (replaces Studio flow)
-// 2) Missed-call menu flows: 1A/1B/2A/2B/3A/3B (stateless, no DB)
-//
-// Notes:
-// - If you want to keep times/booking link: set CAL_BOOKING_LINK in Vercel env.
-// - Uses CLINIC_PHONE for the "call T -" line (fallbacks to TWILIO_FROM_NUMBER).
+import { Redis } from "@upstash/redis";
+
+const redis = Redis.fromEnv();
+
+const TTL_SECONDS = 60 * 10; // 10 minutes
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method not allowed");
@@ -17,160 +13,158 @@ export default async function handler(req, res) {
     const from = String(body.From || "").trim();
     const msgRaw = String(body.Body || "").trim();
 
-    const clinicName = process.env.CLINIC_NAME || "Huron Dental Care";
+    const clinicName = process.env.CLINIC_NAME || "Huron Dental Centre";
+    const loc1 = process.env.CLINIC_LOCATION_1 || "Mississauga";
+    const loc2 = process.env.CLINIC_LOCATION_2 || "Milton";
     const clinicPhone = process.env.CLINIC_PHONE || process.env.TWILIO_FROM_NUMBER || "";
     const bookingLink = process.env.CAL_BOOKING_LINK || "";
-    const rescheduleNoticeHours = Number(process.env.RESCHEDULE_NOTICE_HOURS || 48);
+    const noticeHours = Number(process.env.RESCHEDULE_NOTICE_HOURS || 48);
 
     if (!from) return twiml(res, "Sorry — missing phone number. Please try again.");
-    if (!msgRaw) return twiml(res, menuText(clinicName));
+    if (!msgRaw) return twiml(res, menuText(clinicName, noticeHours));
 
-    // -----------------------------
-    // (A) YES/NO CONFIRMATION HANDLING (replaces Studio)
-    // -----------------------------
+    // 1) YES/NO confirmations (works for booking + reschedule confirmations)
     const yn = normalizeYesNo(msgRaw);
     if (yn === "YES") {
       return twiml(
         res,
-        `Thank you for confirming your presence. We look forward to seeing you.\n` +
-          `${clinicName}\n` +
-          `T - ${clinicPhone}`
+        `Thank you for confirming your presence. We look forward to seeing you.\n${clinicName}\nT - ${clinicPhone}`
       );
     }
     if (yn === "NO") {
       return twiml(
         res,
-        `No problem — we’ve noted you can’t make it. Please reply here or call T - ${clinicPhone} to reschedule.\n` +
-          `${clinicName}`
+        `No problem — we’ve noted you can’t make it. Please reply here or call T - ${clinicPhone} to reschedule.\n${clinicName}`
       );
     }
 
-    // -----------------------------
-    // (B) MENU FLOW HANDLING: 1A/1B/2A/2B/3A/3B
-    // -----------------------------
-    const parsed = parseChoice(msgRaw);
+    // Redis keys per phone number
+    const key = `sms:${from}`;
+    const state = await redis.get(key); // { step, intent } or null
 
-    // If they didn't send a valid menu code, respond like Studio "invalid"
-    // (but also show menu so they can proceed)
-    if (!parsed) {
-      return twiml(
-        res,
-        `Your answer could not be interpreted. Please reply with:\n` +
-          `- YES or NO (for confirmations), OR\n` +
-          `- One of these (example: 1A):\n` +
-          menuText(clinicName)
-      );
+    // 2) If no state, we expect intent (1/2/3)
+    if (!state) {
+      const intent = parseIntent(msgRaw);
+      if (!intent) {
+        return twiml(
+          res,
+          `Your answer could not be interpreted.\n\n${menuText(clinicName, noticeHours)}`
+        );
+      }
+
+      // save state: next step is location
+      await redis.set(key, { step: "location", intent }, { ex: TTL_SECONDS });
+
+      return twiml(res, locationText(loc1, loc2));
     }
 
-    const { actionDigit, locationLetter, details } = parsed;
+    // 3) If waiting for location
+    if (state.step === "location") {
+      const loc = parseLocation(msgRaw);
+      if (!loc) {
+        return twiml(res, `Please reply with 1 or 2.\n\n${locationText(loc1, loc2)}`);
+      }
 
-    // If they sent only code, ask for details
-    if (!details) {
+      // save state: now collect details
+      await redis.set(
+        key,
+        { step: "details", intent: state.intent, location: loc },
+        { ex: TTL_SECONDS }
+      );
+
       return twiml(
         res,
         detailsPrompt({
           clinicName,
           clinicPhone,
-          actionDigit,
-          locationLetter,
           bookingLink,
-          rescheduleNoticeHours,
+          noticeHours,
+          intent: state.intent,
+          location: loc === "1" ? loc1 : loc2,
         })
       );
     }
 
-    // They included details — acknowledge and say the team will confirm
-    return twiml(
-      res,
-      confirmText({
-        clinicName,
-        clinicPhone,
-        actionDigit,
-        locationLetter,
-        bookingLink,
-        rescheduleNoticeHours,
-      })
-    );
-  } catch (_) {
+    // 4) If waiting for details: accept any message as details, acknowledge, then clear state
+    if (state.step === "details") {
+      // optional: you can store the details somewhere later. For now: just acknowledge.
+      await redis.del(key);
+
+      const locationName = state.location === "1" ? loc1 : loc2;
+
+      if (state.intent === "book") {
+        const linkLine = bookingLink ? `\nOptional booking link: ${bookingLink}` : "";
+        return twiml(
+          res,
+          `Thanks — got it. ${clinicName} (${locationName}) will confirm shortly by text or call.${linkLine}`
+        );
+      }
+
+      if (state.intent === "reschedule") {
+        return twiml(
+          res,
+          `Thanks — got it. ${clinicName} (${locationName}) will confirm shortly.\nReminder: we ask for ${noticeHours} hours notice for reschedules.`
+        );
+      }
+
+      return twiml(res, `Thanks — got it. ${clinicName} (${locationName}) will follow up shortly.`);
+    }
+
+    // Fallback: clear unknown state
+    await redis.del(key);
+    return twiml(res, menuText(clinicName, noticeHours));
+  } catch (err) {
     return twiml(res, "Thanks — we received your message. If this is an emergency, please call 911.");
   }
 }
 
 // ---------- Copy blocks ----------
 
-function menuText(clinicName) {
+function menuText(clinicName, noticeHours) {
   return (
     `Sorry we missed you at ${clinicName}.\n` +
-    `Reply with ONE of these (example: 1A):\n` +
-    `1A = Book New Patient Exam (Location A)\n` +
-    `1B = Book New Patient Exam (Location B)\n` +
-    `2A = Reschedule (48h notice) - Location A\n` +
-    `2B = Reschedule (48h notice) - Location B\n` +
-    `3A = Other - Location A\n` +
-    `3B = Other - Location B`
+    `Reply:\n` +
+    `1 = Book new patient exam\n` +
+    `2 = Reschedule / change appointment (${noticeHours}h notice)\n` +
+    `3 = Other`
   );
 }
 
-function detailsPrompt({ clinicName, clinicPhone, actionDigit, locationLetter, bookingLink, rescheduleNoticeHours }) {
-  const loc = locationLabel(locationLetter);
+function locationText(loc1, loc2) {
+  return `Which location?\n1 = ${loc1}\n2 = ${loc2}`;
+}
 
-  if (actionDigit === "1") {
-    const linkLine = bookingLink ? `\nOr book directly here: ${bookingLink}` : "";
+function detailsPrompt({ clinicName, clinicPhone, bookingLink, noticeHours, intent, location }) {
+  if (intent === "book") {
+    const linkLine = bookingLink ? `\nOr book here: ${bookingLink}` : "";
     return (
-      `Got it — ${clinicName} (${loc}).\n` +
+      `Got it — ${clinicName} (${location}).\n` +
       `Please reply with: Full name + preferred day/time.\n` +
-      `Example: "1${locationLetter} - John Smith, next Tuesday after 3pm".\n` +
-      `If you prefer, you can also call T - ${clinicPhone}.` +
+      `Example: "Sarah Khan, next Tue after 3pm".\n` +
+      `You can also call T - ${clinicPhone}.` +
       linkLine
     );
   }
 
-  if (actionDigit === "2") {
+  if (intent === "reschedule") {
     return (
-      `Sure — ${clinicName} (${loc}).\n` +
-      `Reminder: we ask for ${rescheduleNoticeHours} hours notice for reschedules.\n` +
-      `Please reply with: Full name + current appointment day/time + preferred new day/time.\n` +
-      `Example: "2${locationLetter} - Sarah Khan, current Thu 2pm, want Fri morning".\n` +
+      `Sure — ${clinicName} (${location}).\n` +
+      `Reminder: we ask for ${noticeHours} hours notice.\n` +
+      `Please reply with: Full name + current appt day/time + preferred new time.\n` +
+      `Example: "Sarah Khan, current Thu 2pm, want Fri morning".\n` +
       `You can also call T - ${clinicPhone}.`
     );
   }
 
   return (
-    `No problem — ${clinicName} (${loc}).\n` +
+    `No problem — ${clinicName} (${location}).\n` +
     `Please reply with: Full name + how we can help.\n` +
-    `Example: "3${locationLetter} - John Smith, question about insurance".\n` +
+    `Example: "Sarah Khan, question about insurance".\n` +
     `You can also call T - ${clinicPhone}.`
   );
 }
 
-function confirmText({ clinicName, clinicPhone, actionDigit, locationLetter, bookingLink, rescheduleNoticeHours }) {
-  const loc = locationLabel(locationLetter);
-
-  if (actionDigit === "1") {
-    const linkLine = bookingLink ? `\nOptional booking link: ${bookingLink}` : "";
-    return (
-      `Thanks — got it. ${clinicName} (${loc}) will confirm shortly by text or call.\n` +
-      `If you have urgent dental pain or swelling, please call T - ${clinicPhone} right away.` +
-      linkLine
-    );
-  }
-
-  if (actionDigit === "2") {
-    return (
-      `Thanks — got it. ${clinicName} (${loc}) will confirm shortly.\n` +
-      `Reminder: we ask for ${rescheduleNoticeHours} hours notice for reschedules.\n` +
-      `If you are within ${rescheduleNoticeHours} hours, the team will let you know what is possible.\n` +
-      `If you prefer, call T - ${clinicPhone}.`
-    );
-  }
-
-  return (
-    `Thanks — got it. ${clinicName} (${loc}) will follow up shortly.\n` +
-    `If you prefer, call T - ${clinicPhone}.`
-  );
-}
-
-// ---------- Helpers ----------
+// ---------- Parsers ----------
 
 function normalizeYesNo(msg) {
   const s = String(msg || "").trim().toLowerCase();
@@ -179,26 +173,22 @@ function normalizeYesNo(msg) {
   return "";
 }
 
-// Parse "1A", "1A - details", "1 A: details"
-function parseChoice(msg) {
+function parseIntent(msg) {
+  const s = String(msg || "").trim().toLowerCase();
+  if (s === "1" || s.startsWith("1")) return "book";
+  if (s === "2" || s.startsWith("2")) return "reschedule";
+  if (s === "3" || s.startsWith("3")) return "other";
+  return "";
+}
+
+function parseLocation(msg) {
   const s = String(msg || "").trim();
-  const compact = s.replace(/\s+/g, "");
-
-  const actionDigit = compact[0];
-  const locationLetter = (compact[1] || "").toUpperCase();
-
-  if (!["1", "2", "3"].includes(actionDigit)) return null;
-  if (!["A", "B"].includes(locationLetter)) return null;
-
-  const prefixRegex = new RegExp(`^\\s*${actionDigit}\\s*${locationLetter}\\s*([\\-:])?\\s*`, "i");
-  const details = s.replace(prefixRegex, "").trim();
-
-  return { actionDigit, locationLetter, details: details || "" };
+  if (s === "1") return "1";
+  if (s === "2") return "2";
+  return "";
 }
 
-function locationLabel(letter) {
-  return letter === "A" ? "Location A" : "Location B";
-}
+// ---------- TwiML ----------
 
 function twiml(res, message) {
   res.setHeader("Content-Type", "text/xml");
