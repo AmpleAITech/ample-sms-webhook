@@ -9,10 +9,19 @@ function pick(obj, paths) {
   return null;
 }
 
-function formatDateTime(isoString) {
+function formatDateTime(isoString, timeZone = "America/Toronto") {
   const d = new Date(isoString);
-  const date = d.toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
-  const time = d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+  const date = d.toLocaleDateString("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
+  const time = d.toLocaleTimeString("en-US", {
+    timeZone,
+    hour: "numeric",
+    minute: "2-digit",
+  });
   return { date, time };
 }
 
@@ -20,6 +29,7 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
   try {
+    // Auth: token in URL query string
     const token = req.query?.token || req.query?.t || null;
 
     if (!process.env.CAL_WEBHOOK_SECRET) {
@@ -31,12 +41,12 @@ export default async function handler(req, res) {
 
     const body = req.body || {};
 
-    // Soft accept ping/test payloads (200 ignored)
+    // Cal Ping/Test payloads often don't include booking fields.
+    // Treat these as a no-op and return 200 so the Cal "Ping test" shows success.
     const trigger = String(pick(body, ["triggerEvent", "event", "type"]) || "").toLowerCase();
     const hasPayload = !!body.payload;
-    const looksLikePing =
-      !hasPayload || trigger.includes("ping") || trigger.includes("test") || trigger.includes("webhook");
 
+    // Extract booking fields
     const fullName = pick(body, [
       "payload.attendees.0.name",
       "payload.booking.attendees.0.name",
@@ -54,14 +64,17 @@ export default async function handler(req, res) {
       "payload.responses.Phone",
       "payload.responses.Phone number",
       "payload.responses.phone_number",
+
       "payload.booking.responses.phone",
       "payload.booking.responses.phoneNumber",
       "payload.booking.responses.Phone",
       "payload.booking.responses.Phone number",
       "payload.booking.responses.phone_number",
+
       "payload.attendees.0.phoneNumber",
       "payload.attendee.phoneNumber",
       "payload.booking.attendees.0.phoneNumber",
+
       "payload.booker.phoneNumber",
       "payload.booking.booker.phoneNumber",
     ]);
@@ -75,35 +88,54 @@ export default async function handler(req, res) {
       "payload.start",
     ]);
 
+    // Pull timezone from payload if present; otherwise default to Toronto
+    const tz =
+      pick(body, [
+        "payload.timeZone",
+        "payload.booking.timeZone",
+        "payload.event.timeZone",
+        "payload.booking.event.timeZone",
+      ]) || "America/Toronto";
+
+    const looksLikePing =
+      !hasPayload ||
+      trigger.includes("ping") ||
+      trigger.includes("test") ||
+      trigger.includes("webhook");
+
     if (!fullName || !phone || !startTime) {
       if (looksLikePing) {
         return res.status(200).json({
           ok: true,
           ignored: true,
           reason: "ping/test payload missing booking fields",
-          found: { fullName: !!fullName, phone: !!phone, startTime: !!startTime },
+          found: { fullName: !!fullName, phone: !!phone, startTime: !!startTime, tz },
         });
       }
 
+      // For real booking events, keep strict so you catch config issues
       return res.status(400).json({
         error: "Missing required fields from Cal payload",
-        found: { fullName: !!fullName, phone: !!phone, startTime: !!startTime },
-        hint: "In Cal.com Event Type → Booking questions, make Phone number REQUIRED so it appears in webhook payload.",
+        found: { fullName: !!fullName, phone: !!phone, startTime: !!startTime, tz },
+        hint:
+          "In Cal.com Event Type → Booking questions, make Phone number REQUIRED so it appears in webhook payload.",
       });
     }
 
-    const { date, time } = formatDateTime(startTime);
+    const { date, time } = formatDateTime(startTime, tz);
 
     const clinicName = process.env.CLINIC_NAME || "Huron Dental Centre";
     const clinicPhone = process.env.CLINIC_PHONE || "855-393-0900";
 
+    // Consistent SMS format + explicit timezone to avoid confusion
     const smsBody =
-      `Hello, We look forward to seeing ${fullName} on ${date}, at ${time}.\n` +
+      `Hello, We look forward to seeing ${fullName} on ${date}, at ${time} (${tz}).\n` +
       `Please confirm your presence by replying YES or NO.\n\n` +
       `${clinicName},\n` +
       `T - ${clinicPhone}`;
 
     const { TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER } = process.env;
+
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_FROM_NUMBER) {
       return res.status(500).json({
         error: "Missing Twilio env vars",
@@ -116,6 +148,7 @@ export default async function handler(req, res) {
     }
 
     const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+
     const msg = await client.messages.create({
       to: String(phone).trim(),
       from: TWILIO_FROM_NUMBER,
@@ -124,6 +157,9 @@ export default async function handler(req, res) {
 
     return res.status(200).json({ ok: true, sent: true, sid: msg.sid });
   } catch (err) {
-    return res.status(500).json({ error: "Server error", detail: err?.message || String(err) });
+    return res.status(500).json({
+      error: "Server error",
+      detail: err?.message || String(err),
+    });
   }
 }
