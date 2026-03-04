@@ -1,7 +1,6 @@
 // api/retell-events.js
-// Purpose: Retell webhook helper for deterministic demo behavior.
-// If caller hangs up quickly (<= 15s), send missed-call SMS menu (1/2/3).
-// Otherwise do nothing.
+// Retell webhook helper: sends missed-call menu SMS ONLY on quick hangups (<= 15s).
+// Includes "Reply STOP to opt out." ONLY on this menu message.
 
 import twilio from "twilio";
 
@@ -12,7 +11,6 @@ export default async function handler(req, res) {
     const event = req.body || {};
     const call = event.call || event.data || event.payload || event;
 
-    // Only act on ended calls
     const callStatus = String(call?.call_status || "").toLowerCase();
     if (callStatus !== "ended") {
       return res.status(200).json({ ok: true, ignored: "not_ended", callStatus });
@@ -27,7 +25,6 @@ export default async function handler(req, res) {
         (call?.duration_ms ? Math.round(Number(call.duration_ms) / 1000) : 0)
     );
 
-    // Quick hangup = demo missed call trigger
     const isQuickHangup =
       disconnectionReason === "user_hangup" &&
       durationSeconds > 0 &&
@@ -40,32 +37,6 @@ export default async function handler(req, res) {
     if (!fromNumber) return res.status(200).json({ ok: true, ignored: "missing_from_number" });
     if (!callId) return res.status(200).json({ ok: true, ignored: "missing_call_id" });
 
-    // Optional dedupe (fail-open)
-    const dedupeBase = process.env.DEDUPE_WEBHOOK_URL || "";
-    if (dedupeBase) {
-      const dedupeUrl = `${dedupeBase}?action=dedupe_menu&call_id=${encodeURIComponent(callId)}`;
-      try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 1500);
-
-        const dedupeResp = await fetch(dedupeUrl, { method: "GET", signal: controller.signal });
-        clearTimeout(timeout);
-
-        const raw = await dedupeResp.text();
-        try {
-          const parsed = JSON.parse(raw);
-          if (parsed && parsed.allow === false) {
-            return res.status(200).json({ ok: true, ignored: "deduped" });
-          }
-        } catch (_) {
-          // non-JSON: fail open
-        }
-      } catch (_) {
-        // fail open
-      }
-    }
-
-    // Twilio env vars
     const accountSid = process.env.TWILIO_ACCOUNT_SID;
     const authToken = process.env.TWILIO_AUTH_TOKEN;
     const fromSms = process.env.TWILIO_FROM_NUMBER;
@@ -77,21 +48,23 @@ export default async function handler(req, res) {
     const client = twilio(accountSid, authToken);
 
     const clinicName = process.env.CLINIC_NAME || "Huron Dental Centre";
+    const clinicPhone = process.env.CLINIC_PHONE || "855-393-0900";
     const noticeHours = Number(process.env.RESCHEDULE_NOTICE_HOURS || 48);
 
-    // Short menu (matches inbound SMS handler expectations)
     const menuText =
-      `Sorry we missed you at ${clinicName}.\n` +
+      `Sorry we missed you.\n\n` +
       `Reply:\n` +
       `1 = Book new patient exam\n` +
       `2 = Reschedule / change appointment (${noticeHours}h notice)\n` +
-      `3 = Other`;
+      `3 = Other\n\n` +
+      `${clinicName},\n` +
+      `T - ${clinicPhone}\n\n` +
+      `Reply STOP to opt out.`;
 
     await client.messages.create({ from: fromSms, to: fromNumber, body: menuText });
 
     return res.status(200).json({ ok: true, sms_sent: true, isQuickHangup: true });
   } catch (err) {
-    // Demo-safe: avoid webhook retry storms
     return res.status(200).json({ ok: true, error: String(err) });
   }
 }
