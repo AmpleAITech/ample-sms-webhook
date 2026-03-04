@@ -1,16 +1,13 @@
 // api/bestcare-sms.js
 // Twilio inbound SMS webhook (POST, x-www-form-urlencoded)
-// Stateless + robust (no DB needed) by requiring prefix codes:
 //
-// 1A / 1B = book new patient exam (60 min) at Location A/B
-// 2A / 2B = reschedule at Location A/B (48h notice policy)
-// 3A / 3B = other at Location A/B
+// Supports BOTH:
+// 1) YES/NO booking confirmations (replaces Studio flow)
+// 2) Missed-call menu flows: 1A/1B/2A/2B/3A/3B (stateless, no DB)
 //
-// Accepts formats like:
-// "1A"
-// "1A - John Smith, next Tue after 3"
-// "2B: Sarah Khan, current appt Thu 2pm, want Fri morning"
-// If they send only "1A" etc, we prompt for details.
+// Notes:
+// - If you want to keep times/booking link: set CAL_BOOKING_LINK in Vercel env.
+// - Uses CLINIC_PHONE for the "call T -" line (fallbacks to TWILIO_FROM_NUMBER).
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method not allowed");
@@ -20,29 +17,60 @@ export default async function handler(req, res) {
     const from = String(body.From || "").trim();
     const msgRaw = String(body.Body || "").trim();
 
-    if (!from) return twiml(res, "Sorry — missing phone number. Please try again.");
-
     const clinicName = process.env.CLINIC_NAME || "Huron Dental Care";
-    const bookingLink = process.env.CAL_BOOKING_LINK || ""; // optional: include a Cal.com link in replies
+    const clinicPhone = process.env.CLINIC_PHONE || process.env.TWILIO_FROM_NUMBER || "";
+    const bookingLink = process.env.CAL_BOOKING_LINK || "";
     const rescheduleNoticeHours = Number(process.env.RESCHEDULE_NOTICE_HOURS || 48);
 
+    if (!from) return twiml(res, "Sorry — missing phone number. Please try again.");
     if (!msgRaw) return twiml(res, menuText(clinicName));
 
+    // -----------------------------
+    // (A) YES/NO CONFIRMATION HANDLING (replaces Studio)
+    // -----------------------------
+    const yn = normalizeYesNo(msgRaw);
+    if (yn === "YES") {
+      return twiml(
+        res,
+        `Thank you for confirming your presence. We look forward to seeing you.\n` +
+          `${clinicName}\n` +
+          `T - ${clinicPhone}`
+      );
+    }
+    if (yn === "NO") {
+      return twiml(
+        res,
+        `No problem — we’ve noted you can’t make it. Please reply here or call T - ${clinicPhone} to reschedule.\n` +
+          `${clinicName}`
+      );
+    }
+
+    // -----------------------------
+    // (B) MENU FLOW HANDLING: 1A/1B/2A/2B/3A/3B
+    // -----------------------------
     const parsed = parseChoice(msgRaw);
 
-    // If they didn't send a valid code, show menu again (simple + robust)
+    // If they didn't send a valid menu code, respond like Studio "invalid"
+    // (but also show menu so they can proceed)
     if (!parsed) {
-      return twiml(res, menuText(clinicName));
+      return twiml(
+        res,
+        `Your answer could not be interpreted. Please reply with:\n` +
+          `- YES or NO (for confirmations), OR\n` +
+          `- One of these (example: 1A):\n` +
+          menuText(clinicName)
+      );
     }
 
     const { actionDigit, locationLetter, details } = parsed;
 
-    // If they only sent the code with no details, ask for details (still stateless)
+    // If they sent only code, ask for details
     if (!details) {
       return twiml(
         res,
         detailsPrompt({
           clinicName,
+          clinicPhone,
           actionDigit,
           locationLetter,
           bookingLink,
@@ -51,21 +79,24 @@ export default async function handler(req, res) {
       );
     }
 
-    // They included details. We acknowledge and give the next step.
+    // They included details — acknowledge and say the team will confirm
     return twiml(
       res,
       confirmText({
         clinicName,
+        clinicPhone,
         actionDigit,
         locationLetter,
         bookingLink,
         rescheduleNoticeHours,
       })
     );
-  } catch (err) {
+  } catch (_) {
     return twiml(res, "Thanks — we received your message. If this is an emergency, please call 911.");
   }
 }
+
+// ---------- Copy blocks ----------
 
 function menuText(clinicName) {
   return (
@@ -80,7 +111,7 @@ function menuText(clinicName) {
   );
 }
 
-function detailsPrompt({ clinicName, actionDigit, locationLetter, bookingLink, rescheduleNoticeHours }) {
+function detailsPrompt({ clinicName, clinicPhone, actionDigit, locationLetter, bookingLink, rescheduleNoticeHours }) {
   const loc = locationLabel(locationLetter);
 
   if (actionDigit === "1") {
@@ -88,7 +119,8 @@ function detailsPrompt({ clinicName, actionDigit, locationLetter, bookingLink, r
     return (
       `Got it — ${clinicName} (${loc}).\n` +
       `Please reply with: Full name + preferred day/time.\n` +
-      `Example: "1${locationLetter} - John Smith, next Tuesday after 3pm".` +
+      `Example: "1${locationLetter} - John Smith, next Tuesday after 3pm".\n` +
+      `If you prefer, you can also call T - ${clinicPhone}.` +
       linkLine
     );
   }
@@ -98,25 +130,27 @@ function detailsPrompt({ clinicName, actionDigit, locationLetter, bookingLink, r
       `Sure — ${clinicName} (${loc}).\n` +
       `Reminder: we ask for ${rescheduleNoticeHours} hours notice for reschedules.\n` +
       `Please reply with: Full name + current appointment day/time + preferred new day/time.\n` +
-      `Example: "2${locationLetter} - Sarah Khan, current Thu 2pm, want Fri morning".`
+      `Example: "2${locationLetter} - Sarah Khan, current Thu 2pm, want Fri morning".\n` +
+      `You can also call T - ${clinicPhone}.`
     );
   }
 
   return (
     `No problem — ${clinicName} (${loc}).\n` +
     `Please reply with: Full name + how we can help.\n` +
-    `Example: "3${locationLetter} - John Smith, question about insurance".`
+    `Example: "3${locationLetter} - John Smith, question about insurance".\n` +
+    `You can also call T - ${clinicPhone}.`
   );
 }
 
-function confirmText({ clinicName, actionDigit, locationLetter, bookingLink, rescheduleNoticeHours }) {
+function confirmText({ clinicName, clinicPhone, actionDigit, locationLetter, bookingLink, rescheduleNoticeHours }) {
   const loc = locationLabel(locationLetter);
 
   if (actionDigit === "1") {
-    const linkLine = bookingLink ? `\nIf you want, you can also book here: ${bookingLink}` : "";
+    const linkLine = bookingLink ? `\nOptional booking link: ${bookingLink}` : "";
     return (
       `Thanks — got it. ${clinicName} (${loc}) will confirm shortly by text or call.\n` +
-      `If this is urgent dental pain or swelling, please call us back right away.` +
+      `If you have urgent dental pain or swelling, please call T - ${clinicPhone} right away.` +
       linkLine
     );
   }
@@ -125,29 +159,37 @@ function confirmText({ clinicName, actionDigit, locationLetter, bookingLink, res
     return (
       `Thanks — got it. ${clinicName} (${loc}) will confirm shortly.\n` +
       `Reminder: we ask for ${rescheduleNoticeHours} hours notice for reschedules.\n` +
-      `If you are within ${rescheduleNoticeHours} hours, the team will let you know what is possible.`
+      `If you are within ${rescheduleNoticeHours} hours, the team will let you know what is possible.\n` +
+      `If you prefer, call T - ${clinicPhone}.`
     );
   }
 
-  return `Thanks — got it. ${clinicName} (${loc}) will follow up shortly.`;
+  return (
+    `Thanks — got it. ${clinicName} (${loc}) will follow up shortly.\n` +
+    `If you prefer, call T - ${clinicPhone}.`
+  );
 }
 
-// Parse "1A", "1A - details", "1 A: details", etc.
+// ---------- Helpers ----------
+
+function normalizeYesNo(msg) {
+  const s = String(msg || "").trim().toLowerCase();
+  if (s === "yes" || s === "y") return "YES";
+  if (s === "no" || s === "n") return "NO";
+  return "";
+}
+
+// Parse "1A", "1A - details", "1 A: details"
 function parseChoice(msg) {
   const s = String(msg || "").trim();
-
-  // Normalize spaces: allow "1 A - ..." and "1A - ..."
   const compact = s.replace(/\s+/g, "");
 
-  // Must begin with digit 1/2/3 then A/B
   const actionDigit = compact[0];
-  const locationLetter = compact[1]?.toUpperCase();
+  const locationLetter = (compact[1] || "").toUpperCase();
 
   if (!["1", "2", "3"].includes(actionDigit)) return null;
   if (!["A", "B"].includes(locationLetter)) return null;
 
-  // Remove the prefix from the ORIGINAL string in a forgiving way
-  // Accept separators like "-", ":", etc.
   const prefixRegex = new RegExp(`^\\s*${actionDigit}\\s*${locationLetter}\\s*([\\-:])?\\s*`, "i");
   const details = s.replace(prefixRegex, "").trim();
 
@@ -155,11 +197,9 @@ function parseChoice(msg) {
 }
 
 function locationLabel(letter) {
-  // Keep it generic unless you have exact addresses in your KB
   return letter === "A" ? "Location A" : "Location B";
 }
 
-// Twilio expects TwiML XML response
 function twiml(res, message) {
   res.setHeader("Content-Type", "text/xml");
   return res.status(200).send(
