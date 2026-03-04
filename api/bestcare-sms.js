@@ -1,11 +1,9 @@
 // api/bestcare-sms.js
-// Purpose: Twilio inbound SMS webhook (POST, x-www-form-urlencoded).
+// Twilio inbound SMS webhook (POST, x-www-form-urlencoded).
 // Handles:
-// - YES/NO confirmation replies (replaces Studio)
-// - Missed-call menu replies (1/2/3)
-// - Follow-up prompts for details
-//
-// Stateless for maximum demo reliability.
+// - YES/NO confirmation replies
+// - Menu replies 1/2/3
+// - Details-only replies after prompting (demo-safe, stateless)
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method not allowed");
@@ -23,9 +21,7 @@ export default async function handler(req, res) {
     if (!from) return twiml(res, "Sorry — missing phone number. Please try again.");
     if (!msgRaw) return twiml(res, menuText(clinicName, noticeHours));
 
-    // -----------------------------
     // (A) YES / NO confirmations
-    // -----------------------------
     const yn = normalizeYesNo(msgRaw);
     if (yn === "YES") {
       return twiml(
@@ -40,20 +36,12 @@ export default async function handler(req, res) {
       );
     }
 
-    // -----------------------------
-    // (B) Menu replies 1 / 2 / 3
-    // Allow formats like:
-    // "1"
-    // "1 - John Smith, Tue after 3"
-    // "2: Sarah Khan, Thu 2pm -> Fri morning"
-    // -----------------------------
+    // (B) Menu replies 1/2/3
     const parsed = parseMenuReply(msgRaw);
+
+    // Details-only fallback (after we prompted for details)
     if (!parsed) {
-      // invalid -> show menu + hint
-      return twiml(
-        res,
-        `Your answer could not be interpreted.\n\n${menuText(clinicName, noticeHours)}`
-      );
+      return twiml(res, "Thanks. Got it. We’ll confirm shortly.");
     }
 
     const { choice, details } = parsed;
@@ -64,7 +52,10 @@ export default async function handler(req, res) {
         const linkLine = bookingLink ? `\nOr book here: ${bookingLink}` : "";
         return twiml(
           res,
-          `Got it — ${clinicName} (Mississauga).\nPlease reply with: Full name + preferred day/time.\nExample: "Sarah Khan, next Tue after 3pm".\nYou can also call T - ${clinicPhone}.` +
+          `Got it — ${clinicName} (Mississauga).\n` +
+            `Please reply with: Full name + preferred day/time.\n` +
+            `Example: "Sarah Khan, next Tue after 3pm".\n` +
+            `You can also call T - ${clinicPhone}.` +
             linkLine
         );
       }
@@ -72,13 +63,20 @@ export default async function handler(req, res) {
       if (choice === "2") {
         return twiml(
           res,
-          `Sure — ${clinicName} (Mississauga).\nReminder: we ask for ${noticeHours} hours notice for reschedules.\nPlease reply with: Full name + current appt day/time + preferred new time.\nExample: "Sarah Khan, current Thu 2pm, want Fri morning".\nYou can also call T - ${clinicPhone}.`
+          `Sure — ${clinicName} (Mississauga).\n` +
+            `Reminder: we ask for ${noticeHours} hours notice for reschedules.\n` +
+            `Please reply with: Full name + current appt day/time + preferred new time.\n` +
+            `Example: "Sarah Khan, current Thu 2pm, want Fri morning".\n` +
+            `You can also call T - ${clinicPhone}.`
         );
       }
 
       return twiml(
         res,
-        `No problem — ${clinicName} (Mississauga).\nPlease reply with: Full name + how we can help.\nExample: "Sarah Khan, question about insurance".\nYou can also call T - ${clinicPhone}.`
+        `No problem — ${clinicName} (Mississauga).\n` +
+          `Please reply with: Full name + how we can help.\n` +
+          `Example: "Sarah Khan, question about insurance".\n` +
+          `You can also call T - ${clinicPhone}.`
       );
     }
 
@@ -94,7 +92,8 @@ export default async function handler(req, res) {
     if (choice === "2") {
       return twiml(
         res,
-        `Thanks — got it. ${clinicName} (Mississauga) will confirm shortly.\nReminder: we ask for ${noticeHours} hours notice for reschedules.`
+        `Thanks — got it. ${clinicName} (Mississauga) will confirm shortly.\n` +
+          `Reminder: we ask for ${noticeHours} hours notice for reschedules.`
       );
     }
 
@@ -103,8 +102,6 @@ export default async function handler(req, res) {
     return twiml(res, "Thanks — we received your message. If this is an emergency, please call 911.");
   }
 }
-
-// ---------- Menu copy ----------
 
 function menuText(clinicName, noticeHours) {
   return (
@@ -116,15 +113,11 @@ function menuText(clinicName, noticeHours) {
   );
 }
 
-// Parse menu reply: returns { choice: "1"|"2"|"3", details: string }
 function parseMenuReply(msg) {
   const s = String(msg || "").trim();
-
-  // allow leading "1", "2", "3"
   const firstChar = s[0];
   if (!["1", "2", "3"].includes(firstChar)) return null;
 
-  // strip prefix: "1", "1-", "1:" etc
   const prefixRegex = new RegExp(`^\\s*${firstChar}\\s*([\\-:])?\\s*`, "i");
   const details = s.replace(prefixRegex, "").trim();
 
@@ -138,7 +131,6 @@ function normalizeYesNo(msg) {
   return "";
 }
 
-// Twilio expects TwiML XML response
 function twiml(res, message) {
   res.setHeader("Content-Type", "text/xml");
   return res.status(200).send(
