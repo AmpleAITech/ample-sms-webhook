@@ -20,56 +20,59 @@ export default async function handler(req, res) {
 
     // Determine "missed" (real missed OR quick hangup)
     const realMissed = ["no-answer", "busy", "failed", "canceled"].includes(CallStatus);
-    const quickHangup = (CallStatus === "completed" && CallDuration > 0 && CallDuration <= 6);
+    const quickHangup = CallStatus === "completed" && CallDuration > 0 && CallDuration <= 6;
 
-    if (!realMissed && !quickHangup) {
-      return res.status(200).send("ignored");
-    }
+    if (!realMissed && !quickHangup) return res.status(200).send("ignored");
     if (!From) return res.status(200).send("missing From");
 
-    const accountSid = process.env.TWILIO_ACCOUNT_SID;
-    const authToken = process.env.TWILIO_AUTH_TOKEN;
-    const fromNumber = process.env.TWILIO_FROM_NUMBER;
-
-    if (!accountSid || !authToken || !fromNumber) {
+    const { TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER } = process.env;
+    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_FROM_NUMBER) {
       return res.status(500).send("Missing Twilio env vars");
     }
 
-    const client = twilio(accountSid, authToken);
+    // Optional dedupe (fail-open)
+    // If you have a dedupe endpoint, set DEDUPE_WEBHOOK_URL to something that returns JSON: { allow: true/false }
+    // Example call: `${DEDUPE_WEBHOOK_URL}?action=dedupe_menu&call_id=<CallSid>`
+    const dedupeBase = process.env.DEDUPE_WEBHOOK_URL || "";
+    if (dedupeBase) {
+      const dedupeUrl = `${dedupeBase}?action=dedupe_menu&call_id=${encodeURIComponent(CallSid)}`;
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 1500);
+        const dedupeResp = await fetch(dedupeUrl, { method: "GET", signal: controller.signal });
+        clearTimeout(timeout);
+
+        const raw = await dedupeResp.text();
+        try {
+          const parsed = JSON.parse(raw);
+          if (parsed && parsed.allow === false) return res.status(200).send("deduped");
+        } catch (_) {
+          // fail open
+        }
+      } catch (_) {
+        // fail open
+      }
+    }
+
+    const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+
+    const clinicName = process.env.CLINIC_NAME || "Huron Dental Care";
 
     const menuText =
-      "Sorry we missed you at Best Care Medical Centre.\n" +
-      "Please reply with 1, 2, or 3 only:\n" +
-      "1 = Book a telephone appointment\n" +
-      "2 = Change an existing appointment\n" +
-      "3 = Other";
+      `Sorry we missed you at ${clinicName}.\n` +
+      `Reply with ONE of these (example: 1A):\n` +
+      `1A = Book New Patient Exam (Location A)\n` +
+      `1B = Book New Patient Exam (Location B)\n` +
+      `2A = Reschedule (48h notice) - Location A\n` +
+      `2B = Reschedule (48h notice) - Location B\n` +
+      `3A = Other - Location A\n` +
+      `3B = Other - Location B`;
 
-    // Send SMS menu
     await client.messages.create({
-      from: fromNumber,
+      from: TWILIO_FROM_NUMBER,
       to: From,
-      body: menuText
+      body: menuText,
     });
-
-    // Optional: log the missed call + auto text sent (nice for demo)
-    try {
-      await fetch("https://ample-sms-webhook-demov1.vercel.app/api/bestcare-intake", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          source: "phone",
-          scenario: "missed_call",
-          phone: From,
-          reason_for_appointment: quickHangup
-            ? "Missed call (simulated quick hangup) — auto SMS menu sent"
-            : "Missed call — auto SMS menu sent",
-          consent: "n/a",
-          urgent_flag: "no",
-          notes: `CallStatus=${CallStatus} CallDuration=${CallDuration}`,
-          call_sid: CallSid
-        })
-      });
-    } catch (_) {}
 
     return res.status(200).send("ok");
   } catch (err) {
