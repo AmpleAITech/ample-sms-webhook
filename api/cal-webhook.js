@@ -27,9 +27,8 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
   try {
-    // ✅ AUTH (PERMANENT): token in URL query string
-    // Cal.com Subscriber URL must be:
-    // https://ample-sms-webhook-demov1.vercel.app/api/cal-webhook?token=ample_demo_9f3k2_84jskqPz_2026
+    // AUTH: token in URL query string
+    // e.g. https://<your-vercel>/api/cal-webhook?token=<CAL_WEBHOOK_SECRET>
     const token = req.query?.token || req.query?.t || null;
 
     if (!process.env.CAL_WEBHOOK_SECRET) {
@@ -39,14 +38,8 @@ export default async function handler(req, res) {
       return res.status(401).json({ error: "Unauthorized webhook" });
     }
 
-    // ---- Parse Cal payload safely (Cal versions vary) ----
     const body = req.body || {};
 
-    // (Optional) if you want to ignore non-created events later:
-    // const trigger = pick(body, ["triggerEvent", "event", "type"]);
-    // if (trigger && !String(trigger).toLowerCase().includes("created")) return res.status(200).json({ ignored: true });
-
-    // 1) Who booked?
     const fullName = pick(body, [
       "payload.attendees.0.name",
       "payload.booking.attendees.0.name",
@@ -58,9 +51,7 @@ export default async function handler(req, res) {
       "payload.user.name",
     ]);
 
-    // 2) Phone number (must exist in Cal booking questions OR attendee payload)
     const phone = pick(body, [
-      // Booking questions commonly end up here
       "payload.responses.phone",
       "payload.responses.phoneNumber",
       "payload.responses.Phone",
@@ -72,17 +63,14 @@ export default async function handler(req, res) {
       "payload.booking.responses.Phone number",
       "payload.booking.responses.phone_number",
 
-      // Attendee variants
       "payload.attendees.0.phoneNumber",
       "payload.attendee.phoneNumber",
       "payload.booking.attendees.0.phoneNumber",
 
-      // Booker variants
       "payload.booker.phoneNumber",
       "payload.booking.booker.phoneNumber",
     ]);
 
-    // 3) Appointment time
     const startTime = pick(body, [
       "payload.startTime",
       "payload.booking.startTime",
@@ -103,17 +91,16 @@ export default async function handler(req, res) {
 
     const { date, time } = formatDateTime(startTime);
 
-    // ---- Compose SMS to match your example ----
     const clinicPhone = process.env.CLINIC_PHONE || process.env.TWILIO_FROM_NUMBER;
+    const clinicName = process.env.CLINIC_NAME || "Huron Dental Care";
 
     const smsBody =
       `Hello, We look forward to seeing ${fullName} on ${date}, at ${time}. ` +
       `Please confirm your presence by replying YES or NO.\n` +
       `Thank you.\n` +
-      `Ample AI Demo Clinic\n` +
+      `${clinicName}\n` +
       `T - ${clinicPhone}`;
 
-    // ---- Send SMS via Twilio ----
     const { TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER } = process.env;
 
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_FROM_NUMBER) {
