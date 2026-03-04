@@ -1,6 +1,7 @@
 // api/retell-events.js
-// FINAL: Voice -> Sheets forwarding + Missed-call -> single menu SMS (deduped)
-// Safety: Missed-call SMS logic is unchanged. Voice-forwarding is skipped when isQuickHangup=true.
+// PURPOSE (Huron demo):
+// Retell webhook helper to trigger the missed-call menu SMS ONLY when the call was a "quick hangup".
+// We DO NOT forward voice data to Google Sheets in this Huron demo.
 
 import twilio from "twilio";
 
@@ -27,178 +28,67 @@ export default async function handler(req, res) {
         (call?.duration_ms ? Math.round(Number(call.duration_ms) / 1000) : 0)
     );
 
-    const recordingUrl = String(call?.recording_url || "").trim();
-    const callSid = String(call?.telephony_identifier?.twilio_call_sid || "").trim();
-
-    // -----------------------------
-    // Missed call detection (used to guard voice forwarding)
-    // -----------------------------
+    // Demo assist: treat quick hangup as missed call (to reliably show missed-call SMS on demos)
     const isQuickHangup =
       disconnectionReason === "user_hangup" &&
       durationSeconds > 0 &&
       durationSeconds <= 15;
 
-    // -----------------------------
-    // Helper: safely pull extracted fields (Retell nesting can vary)
-    // -----------------------------
-    function findValueDeep(obj, key) {
-      if (!obj || typeof obj !== "object") return "";
-      if (Object.prototype.hasOwnProperty.call(obj, key)) {
-        const v = obj[key];
-        if (v !== null && v !== undefined && String(v).trim() !== "") return String(v).trim();
-      }
-      for (const k of Object.keys(obj)) {
-        const child = obj[k];
-        if (child && typeof child === "object") {
-          const found = findValueDeep(child, key);
-          if (found) return found;
-        }
-      }
-      return "";
-    }
-
-    // Extract fields (match Retell post-call extraction field names)
-    const extractedScenario = findValueDeep(call, "scenario") || findValueDeep(event, "scenario");
-    const extractedFirst = findValueDeep(call, "first_name") || findValueDeep(event, "first_name");
-    const extractedLast = findValueDeep(call, "last_name") || findValueDeep(event, "last_name");
-    const extractedPhone =
-      findValueDeep(call, "phone") || findValueDeep(event, "phone") || fromNumber;
-    const extractedReason =
-      findValueDeep(call, "reason_for_appointment") ||
-      findValueDeep(event, "reason_for_appointment");
-    const extractedConsent = findValueDeep(call, "consent") || findValueDeep(event, "consent");
-    const extractedUrgent =
-      findValueDeep(call, "urgent_flag") || findValueDeep(event, "urgent_flag");
-    const extractedNotes = findValueDeep(call, "notes") || findValueDeep(event, "notes");
-
-    // NEW: reschedule preferred time extraction (you add this in Retell)
-    const extractedPreferredTime =
-      findValueDeep(call, "preferred_time") || findValueDeep(event, "preferred_time");
-
-    // Normalize voice scenario into your demo labels
-    const scRaw = String(extractedScenario || "").trim().toLowerCase();
-    const scenarioMap = {
-      new_patient: "telephone_request",
-      "new patient": "telephone_request",
-      telephone_request: "telephone_request",
-      telephone_appointment_request: "telephone_request",
-      "telephone appointment request": "telephone_request",
-
-      reschedule: "reschedule_request",
-      reschedule_request: "reschedule_request",
-      "change appointment": "reschedule_request",
-      cancel: "reschedule_request",
-      "cancel request": "reschedule_request",
-    };
-    const normalizedVoiceScenario = scenarioMap[scRaw] || "";
-
-    // -----------------------------
-    // (A) VOICE → SHEETS FORWARDING
-    // Never runs for missed-call quick hangups
-    // -----------------------------
-    const isConversation = durationSeconds >= 8;
-
-    if (!isQuickHangup && isConversation && normalizedVoiceScenario) {
-      // Build notes safely without breaking anything
-      let finalNotes = String(extractedNotes || "").trim();
-
-      // If reschedule, ensure we store the requested new time in notes
-      if (normalizedVoiceScenario === "reschedule_request") {
-        const pt = String(extractedPreferredTime || "").trim();
-        if (pt) {
-          finalNotes = finalNotes ? `${finalNotes} | Preferred new time: ${pt}` : `Preferred new time: ${pt}`;
-        } else if (!finalNotes) {
-          // demo-safe fallback (still logs scenario + reason even if extraction missed)
-          finalNotes = "";
-        }
-      }
-
-      try {
-        await fetch("https://ample-sms-webhook-demov1.vercel.app/api/bestcare-intake", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            source: "phone",
-            scenario: normalizedVoiceScenario,
-            first_name: extractedFirst,
-            last_name: extractedLast,
-            phone: extractedPhone,
-            email: "", // intake handler fills placeholder silently
-            gender: "",
-            reason_for_appointment: extractedReason,
-            consent: extractedConsent,
-            urgent_flag: extractedUrgent || "no",
-            notes: finalNotes,
-            call_sid: callSid,
-            recording_url: recordingUrl,
-          }),
-        });
-      } catch (_) {
-        // demo-safe: ignore forwarding errors
-      }
-
-      // Stop here so normal calls never fall into missed-call SMS logic
-      return res.status(200).json({ ok: true, forwarded: true, scenario: normalizedVoiceScenario });
-    }
-
-    // -----------------------------
-    // (B) MISSED CALL → MENU SMS (UNCHANGED)
-    // -----------------------------
     if (!isQuickHangup) {
-      return res.status(200).json({ ok: true, done: true });
+      return res.status(200).json({ ok: true, done: true, isQuickHangup: false });
     }
 
     if (!fromNumber) return res.status(200).json({ ok: true, ignored: "missing_from_number" });
     if (!callId) return res.status(200).json({ ok: true, ignored: "missing_call_id" });
 
-    // DEDUPE (GET) - FAIL OPEN
-    const dedupeBase = process.env.BESTCARE_DEDUPE_WEBHOOK_URL;
-    if (!dedupeBase) {
-      return res.status(500).json({ ok: false, error: "Missing BESTCARE_DEDUPE_WEBHOOK_URL" });
-    }
-
-    const dedupeUrl = `${dedupeBase}?action=dedupe_menu&call_id=${encodeURIComponent(callId)}`;
-
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 1500);
-
-      const dedupeResp = await fetch(dedupeUrl, { method: "GET", signal: controller.signal });
-      clearTimeout(timeout);
-
-      const raw = await dedupeResp.text();
+    // Optional dedupe (fail-open)
+    const dedupeBase = process.env.DEDUPE_WEBHOOK_URL || "";
+    if (dedupeBase) {
+      const dedupeUrl = `${dedupeBase}?action=dedupe_menu&call_id=${encodeURIComponent(callId)}`;
       try {
-        const parsed = JSON.parse(raw);
-        if (!parsed.allow) return res.status(200).json({ ok: true, ignored: "deduped" });
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 1500);
+
+        const dedupeResp = await fetch(dedupeUrl, { method: "GET", signal: controller.signal });
+        clearTimeout(timeout);
+
+        const raw = await dedupeResp.text();
+        try {
+          const parsed = JSON.parse(raw);
+          if (parsed && parsed.allow === false) return res.status(200).json({ ok: true, ignored: "deduped" });
+        } catch (_) {
+          // fail open
+        }
       } catch (_) {
-        // non-JSON: fail open
+        // fail open
       }
-    } catch (_) {
-      // fail open
     }
 
     // Send menu SMS via Twilio
-    const accountSid = process.env.TWILIO_ACCOUNT_SID;
-    const authToken = process.env.TWILIO_AUTH_TOKEN;
-    const fromSms = process.env.TWILIO_FROM_NUMBER;
-
-    if (!accountSid || !authToken || !fromSms) {
+    const { TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER } = process.env;
+    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_FROM_NUMBER) {
       return res.status(500).json({ ok: false, error: "Missing Twilio env vars" });
     }
 
-    const client = twilio(accountSid, authToken);
+    const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+
+    const clinicName = process.env.CLINIC_NAME || "Huron Dental Care";
 
     const menuText =
-      "Sorry we missed you at Best Care Medical Centre.\n" +
-      "Please reply with 1, 2, or 3 only:\n" +
-      "1 = Book a telephone appointment\n" +
-      "2 = Change an existing appointment\n" +
-      "3 = Other";
+      `Sorry we missed you at ${clinicName}.\n` +
+      `Reply with ONE of these (example: 1A):\n` +
+      `1A = Book New Patient Exam (Location A)\n` +
+      `1B = Book New Patient Exam (Location B)\n` +
+      `2A = Reschedule (48h notice) - Location A\n` +
+      `2B = Reschedule (48h notice) - Location B\n` +
+      `3A = Other - Location A\n` +
+      `3B = Other - Location B`;
 
-    await client.messages.create({ from: fromSms, to: fromNumber, body: menuText });
+    await client.messages.create({ from: TWILIO_FROM_NUMBER, to: fromNumber, body: menuText });
 
-    return res.status(200).json({ ok: true, sms_sent: true });
+    return res.status(200).json({ ok: true, sms_sent: true, isQuickHangup: true });
   } catch (err) {
+    // Demo-safe: always 200 so webhook doesn't retry forever
     return res.status(200).json({ ok: true, error: String(err) });
   }
 }
