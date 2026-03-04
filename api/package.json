@@ -1,5 +1,6 @@
 {
   "dependencies": {
-    "twilio": "^4.0.0"
+    "twilio": "^4.0.0",
+    "@upstash/redis": "^1.34.0"
   }
 }
