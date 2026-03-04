@@ -28,7 +28,6 @@ export default async function handler(req, res) {
 
   try {
     // AUTH: token in URL query string
-    // e.g. https://<your-vercel>/api/cal-webhook?token=<CAL_WEBHOOK_SECRET>
     const token = req.query?.token || req.query?.t || null;
 
     if (!process.env.CAL_WEBHOOK_SECRET) {
@@ -40,6 +39,12 @@ export default async function handler(req, res) {
 
     const body = req.body || {};
 
+    // Cal Ping/Test payloads often don't include booking fields.
+    // Treat these as a no-op and return 200 so the Cal "Ping test" shows success.
+    const trigger = String(pick(body, ["triggerEvent", "event", "type"]) || "").toLowerCase();
+    const hasPayload = !!body.payload;
+
+    // Extract fields
     const fullName = pick(body, [
       "payload.attendees.0.name",
       "payload.booking.attendees.0.name",
@@ -80,7 +85,24 @@ export default async function handler(req, res) {
       "payload.start",
     ]);
 
+    // If it's clearly a ping/test (or missing payload), fail soft
+    const looksLikePing =
+      !hasPayload ||
+      trigger.includes("ping") ||
+      trigger.includes("test") ||
+      trigger.includes("webhook");
+
     if (!fullName || !phone || !startTime) {
+      if (looksLikePing) {
+        return res.status(200).json({
+          ok: true,
+          ignored: true,
+          reason: "ping/test payload missing booking fields",
+          found: { fullName: !!fullName, phone: !!phone, startTime: !!startTime },
+        });
+      }
+
+      // For real booking events, keep this strict so you catch config issues
       return res.status(400).json({
         error: "Missing required fields from Cal payload",
         found: { fullName: !!fullName, phone: !!phone, startTime: !!startTime },
@@ -92,7 +114,7 @@ export default async function handler(req, res) {
     const { date, time } = formatDateTime(startTime);
 
     const clinicPhone = process.env.CLINIC_PHONE || process.env.TWILIO_FROM_NUMBER;
-    const clinicName = process.env.CLINIC_NAME || "Huron Dental Care";
+    const clinicName = process.env.CLINIC_NAME || "Huron Dental Centre";
 
     const smsBody =
       `Hello, We look forward to seeing ${fullName} on ${date}, at ${time}. ` +
