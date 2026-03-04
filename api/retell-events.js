@@ -1,12 +1,12 @@
 // api/retell-events.js
-// PURPOSE (Huron demo):
-// Retell webhook helper to trigger the missed-call menu SMS ONLY when the call was a "quick hangup".
-// We DO NOT forward voice data to Google Sheets in this Huron demo.
+// Purpose: Retell webhook helper for deterministic demo behavior.
+// If caller hangs up quickly (<= 15s), send missed-call SMS menu (1/2/3).
+// Otherwise do nothing.
 
 import twilio from "twilio";
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).json({ ok: false });
+  if (req.method !== "POST") return res.status(405).json({ ok: false, hint: "POST only" });
 
   try {
     const event = req.body || {};
@@ -18,7 +18,6 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, ignored: "not_ended", callStatus });
     }
 
-    // Common call metadata
     const callId = String(call?.call_id || "").trim();
     const fromNumber = String(call?.from_number || "").trim();
     const disconnectionReason = String(call?.disconnection_reason || "").toLowerCase();
@@ -28,7 +27,7 @@ export default async function handler(req, res) {
         (call?.duration_ms ? Math.round(Number(call.duration_ms) / 1000) : 0)
     );
 
-    // Demo assist: treat quick hangup as missed call (to reliably show missed-call SMS on demos)
+    // Quick hangup = demo missed call trigger
     const isQuickHangup =
       disconnectionReason === "user_hangup" &&
       durationSeconds > 0 &&
@@ -55,40 +54,44 @@ export default async function handler(req, res) {
         const raw = await dedupeResp.text();
         try {
           const parsed = JSON.parse(raw);
-          if (parsed && parsed.allow === false) return res.status(200).json({ ok: true, ignored: "deduped" });
+          if (parsed && parsed.allow === false) {
+            return res.status(200).json({ ok: true, ignored: "deduped" });
+          }
         } catch (_) {
-          // fail open
+          // non-JSON: fail open
         }
       } catch (_) {
         // fail open
       }
     }
 
-    // Send menu SMS via Twilio
-    const { TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER } = process.env;
-    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_FROM_NUMBER) {
+    // Twilio env vars
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
+    const fromSms = process.env.TWILIO_FROM_NUMBER;
+
+    if (!accountSid || !authToken || !fromSms) {
       return res.status(500).json({ ok: false, error: "Missing Twilio env vars" });
     }
 
-    const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+    const client = twilio(accountSid, authToken);
 
-    const clinicName = process.env.CLINIC_NAME || "Huron Dental Care";
+    const clinicName = process.env.CLINIC_NAME || "Huron Dental Centre";
+    const noticeHours = Number(process.env.RESCHEDULE_NOTICE_HOURS || 48);
 
+    // Short menu (matches inbound SMS handler expectations)
     const menuText =
       `Sorry we missed you at ${clinicName}.\n` +
-      `Reply with ONE of these (example: 1A):\n` +
-      `1A = Book New Patient Exam (Location A)\n` +
-      `1B = Book New Patient Exam (Location B)\n` +
-      `2A = Reschedule (48h notice) - Location A\n` +
-      `2B = Reschedule (48h notice) - Location B\n` +
-      `3A = Other - Location A\n` +
-      `3B = Other - Location B`;
+      `Reply:\n` +
+      `1 = Book new patient exam\n` +
+      `2 = Reschedule / change appointment (${noticeHours}h notice)\n` +
+      `3 = Other`;
 
-    await client.messages.create({ from: TWILIO_FROM_NUMBER, to: fromNumber, body: menuText });
+    await client.messages.create({ from: fromSms, to: fromNumber, body: menuText });
 
     return res.status(200).json({ ok: true, sms_sent: true, isQuickHangup: true });
   } catch (err) {
-    // Demo-safe: always 200 so webhook doesn't retry forever
+    // Demo-safe: avoid webhook retry storms
     return res.status(200).json({ ok: true, error: String(err) });
   }
 }
