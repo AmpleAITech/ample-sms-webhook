@@ -1,9 +1,10 @@
 // api/bestcare-missed-call.js
-// Twilio Voice "Call status changes" webhook
-// Sends missed-call SMS if:
-// - status is no-answer/busy/failed/canceled
-// OR
-// - call completed quickly (CallDuration <= 6 seconds) => "simulated missed call"
+// Purpose: Twilio Voice "Call status changes" webhook.
+// Sends missed-call SMS menu ONLY for true missed call statuses:
+// no-answer, busy, failed, canceled
+//
+// IMPORTANT: Do NOT treat "completed + short duration" as missed call here
+// if Retell is handling quick-hangups. This prevents double SMS.
 
 import twilio from "twilio";
 
@@ -13,17 +14,14 @@ export default async function handler(req, res) {
   try {
     const body = req.body || {};
 
-    const CallStatus = String(body.CallStatus || "").toLowerCase();
-    const From = String(body.From || "").trim();
-    const CallSid = String(body.CallSid || "").trim();
-    const CallDuration = Number(body.CallDuration || 0); // only present on completed
+    const callStatus = String(body.CallStatus || "").toLowerCase();
+    const from = String(body.From || "").trim();
+    const callSid = String(body.CallSid || "").trim();
 
-    // Determine "missed" (real missed OR quick hangup)
-    const realMissed = ["no-answer", "busy", "failed", "canceled"].includes(CallStatus);
-    const quickHangup = CallStatus === "completed" && CallDuration > 0 && CallDuration <= 6;
+    const isTrueMissed = ["no-answer", "busy", "failed", "canceled"].includes(callStatus);
 
-    if (!realMissed && !quickHangup) return res.status(200).send("ignored");
-    if (!From) return res.status(200).send("missing From");
+    if (!isTrueMissed) return res.status(200).send("ignored");
+    if (!from) return res.status(200).send("missing From");
 
     const { TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER } = process.env;
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_FROM_NUMBER) {
@@ -31,11 +29,9 @@ export default async function handler(req, res) {
     }
 
     // Optional dedupe (fail-open)
-    // If you have a dedupe endpoint, set DEDUPE_WEBHOOK_URL to something that returns JSON: { allow: true/false }
-    // Example call: `${DEDUPE_WEBHOOK_URL}?action=dedupe_menu&call_id=<CallSid>`
     const dedupeBase = process.env.DEDUPE_WEBHOOK_URL || "";
-    if (dedupeBase) {
-      const dedupeUrl = `${dedupeBase}?action=dedupe_menu&call_id=${encodeURIComponent(CallSid)}`;
+    if (dedupeBase && callSid) {
+      const dedupeUrl = `${dedupeBase}?action=dedupe_menu&call_id=${encodeURIComponent(callSid)}`;
       try {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 1500);
@@ -56,21 +52,19 @@ export default async function handler(req, res) {
 
     const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
-    const clinicName = process.env.CLINIC_NAME || "Huron Dental Care";
+    const clinicName = process.env.CLINIC_NAME || "Huron Dental Centre";
+    const noticeHours = Number(process.env.RESCHEDULE_NOTICE_HOURS || 48);
 
     const menuText =
       `Sorry we missed you at ${clinicName}.\n` +
-      `Reply with ONE of these (example: 1A):\n` +
-      `1A = Book New Patient Exam (Location A)\n` +
-      `1B = Book New Patient Exam (Location B)\n` +
-      `2A = Reschedule (48h notice) - Location A\n` +
-      `2B = Reschedule (48h notice) - Location B\n` +
-      `3A = Other - Location A\n` +
-      `3B = Other - Location B`;
+      `Reply:\n` +
+      `1 = Book new patient exam\n` +
+      `2 = Reschedule / change appointment (${noticeHours}h notice)\n` +
+      `3 = Other`;
 
     await client.messages.create({
       from: TWILIO_FROM_NUMBER,
-      to: From,
+      to: from,
       body: menuText,
     });
 
