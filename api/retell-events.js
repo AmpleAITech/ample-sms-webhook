@@ -1,4 +1,3 @@
-// api/retell-events.js
 import twilio from "twilio";
 import { Redis } from "@upstash/redis";
 
@@ -11,6 +10,7 @@ export default async function handler(req, res) {
     const event = req.body || {};
     const call = event.call || event.data || event.payload || event;
 
+    // Only act on ended calls
     const callStatus = String(call?.call_status || "").toLowerCase();
     if (callStatus !== "ended") {
       return res.status(200).json({ ok: true, ignored: "not_ended", callStatus });
@@ -25,6 +25,7 @@ export default async function handler(req, res) {
         (call?.duration_ms ? Math.round(Number(call.duration_ms) / 1000) : 0)
     );
 
+    // Quick hangup detection (<= 15s)
     const isQuickHangup =
       disconnectionReason === "user_hangup" &&
       durationSeconds > 0 &&
@@ -38,12 +39,13 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, ignored: "missing_call_id_or_number" });
     }
 
-    // DEDUPE (2 minutes)
+    // DEDUPE (2 minutes) — prevents duplicate menu SMS if Retell delivers twice
     const key = `retell:menu:${callId}`;
     const already = await redis.get(key);
     if (already) return res.status(200).json({ ok: true, ignored: "deduped" });
     await redis.set(key, "1", { ex: 120 });
 
+    // Twilio send
     const { TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER } = process.env;
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_FROM_NUMBER) {
       return res.status(500).json({ ok: false, error: "Missing Twilio env vars" });
