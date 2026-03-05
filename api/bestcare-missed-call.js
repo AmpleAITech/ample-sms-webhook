@@ -2,7 +2,7 @@
 // Twilio Voice "Call status changes" webhook.
 // Sends missed-call menu SMS ONLY for true missed call statuses:
 // no-answer, busy, failed, canceled
-// Includes "Reply STOP to opt out." ONLY on this menu message.
+// MENU: New Patient only.
 
 import twilio from "twilio";
 
@@ -27,14 +27,11 @@ export default async function handler(req, res) {
 
     const clinicName = process.env.CLINIC_NAME || "Huron Dental Centre";
     const clinicPhone = process.env.CLINIC_PHONE || "855-393-0900";
-    const noticeHours = Number(process.env.RESCHEDULE_NOTICE_HOURS || 48);
 
     const menuText =
       `Sorry we missed you.\n\n` +
       `Reply:\n` +
-      `1 = Book new patient exam\n` +
-      `2 = Reschedule / change appointment (${noticeHours}h notice)\n` +
-      `3 = Other\n\n` +
+      `1 = Book a New Patient Exam\n\n` +
       `${clinicName},\n` +
       `T - ${clinicPhone}\n\n` +
       `Reply STOP to opt out.`;
