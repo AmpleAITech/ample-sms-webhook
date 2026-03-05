@@ -1,10 +1,11 @@
 // api/bestcare-sms.js
 // Twilio inbound SMS webhook (POST, x-www-form-urlencoded).
-// Handles:
-// - YES/NO confirmation replies
-// - Menu replies 1/2/3
-// - Details-only replies after prompting (stateless, demo-safe)
-// Enforces consistent SMS formatting + clinic footer.
+// BULLETPROOF DEMO MODE:
+// - Accepts only:
+//    * YES/NO (confirmation replies)
+//    * "1" (new patient exam request) optionally with details: "1 - John Smith, Fri morning"
+// - Anything else => demo refusal message
+// - Consistent footer
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method not allowed");
@@ -16,15 +17,14 @@ export default async function handler(req, res) {
 
     const clinicName = process.env.CLINIC_NAME || "Huron Dental Centre";
     const clinicPhone = process.env.CLINIC_PHONE || "855-393-0900";
-    const bookingLink = process.env.CAL_BOOKING_LINK || "";
-    const noticeHours = Number(process.env.RESCHEDULE_NOTICE_HOURS || 48);
+    const bookingLink = process.env.CAL_BOOKING_LINK || ""; // optional
 
     if (!from) return twiml(res, `Sorry — missing phone number.\n\n${footer(clinicName, clinicPhone)}`);
-    if (!msgRaw) return twiml(res, menuText(clinicName, clinicPhone, noticeHours));
 
-    // -----------------------------
-    // (A) YES / NO confirmations
-    // -----------------------------
+    // Empty message -> send menu
+    if (!msgRaw) return twiml(res, menuText(clinicName, clinicPhone));
+
+    // YES/NO confirmations for booking confirmation SMS
     const yn = normalizeYesNo(msgRaw);
     if (yn === "YES") {
       return twiml(
@@ -35,102 +35,70 @@ export default async function handler(req, res) {
     if (yn === "NO") {
       return twiml(
         res,
-        `No problem — we’ve noted you can’t make it.\nPlease reply here or call to reschedule.\n\n${footer(
+        `No problem — we’ve noted you can’t make it.\nPlease call us to reschedule.\n\n${footer(
           clinicName,
           clinicPhone
         )}`
       );
     }
 
-    // -----------------------------
-    // (B) Menu replies 1 / 2 / 3
-    // -----------------------------
-    const parsed = parseMenuReply(msgRaw);
+    // NEW PATIENT ONLY: must start with "1"
+    const parsed = parseOneOnly(msgRaw);
 
-    // Details-only fallback (after we prompted for details)
+    // If message is NOT "1..." => refuse
     if (!parsed) {
-      return twiml(res, `Thanks. Got it. We’ll confirm shortly.\n\n${footer(clinicName, clinicPhone)}`);
+      return twiml(res, demoRefusal(clinicName, clinicPhone));
     }
 
-    const { choice, details } = parsed;
+    const details = parsed.details;
 
-    // If no details, prompt for details based on choice
+    // If they just sent "1" -> ask for details
     if (!details) {
-      if (choice === "1") {
-        const linkLine = bookingLink ? `\n\nOr book here:\n${bookingLink}` : "";
-        return twiml(
-          res,
-          `Please reply with: Full name + preferred day/time.\n\n` +
-            `Example: "Sarah Khan, next Tue after 3pm".` +
-            linkLine +
-            `\n\n${footer(clinicName, clinicPhone)}`
-        );
-      }
-
-      if (choice === "2") {
-        // EXACT format user requested
-        return twiml(
-          res,
-          `Reminder: we ask for ${noticeHours} hours notice for reschedules.\n\n` +
-            `Please reply with: Full name + current appt day/time + preferred new time.\n\n` +
-            `Example: "Sarah Khan, current Thu 2pm, want Fri morning".\n\n` +
-            `${footer(clinicName, clinicPhone)}`
-        );
-      }
-
-      // choice === "3"
+      const linkLine = bookingLink ? `\n\nOr book here:\n${bookingLink}` : "";
       return twiml(
         res,
-        `Please reply with: Full name + how we can help.\n\n` +
-          `Example: "Sarah Khan, question about insurance".\n\n` +
-          `${footer(clinicName, clinicPhone)}`
+        `Please reply with: Full name + preferred day/time.\n\n` +
+          `Example: "Sarah Khan, Friday morning".` +
+          linkLine +
+          `\n\n${footer(clinicName, clinicPhone)}`
       );
     }
 
-    // They included details in the same message -> acknowledge
-    if (choice === "1") {
-      const linkLine = bookingLink ? `\n\nOptional booking link:\n${bookingLink}` : "";
-      return twiml(
-        res,
-        `Thanks. Got it. We’ll confirm shortly.` + linkLine + `\n\n${footer(clinicName, clinicPhone)}`
-      );
-    }
-
-    if (choice === "2") {
-      return twiml(
-        res,
-        `Thanks. Got it. We’ll confirm shortly.\n\n${footer(clinicName, clinicPhone)}`
-      );
-    }
-
-    // choice === "3"
+    // If they sent "1 - details" -> acknowledge (demo capture)
     return twiml(res, `Thanks. Got it. We’ll confirm shortly.\n\n${footer(clinicName, clinicPhone)}`);
   } catch (_) {
     const clinicName = process.env.CLINIC_NAME || "Huron Dental Centre";
     const clinicPhone = process.env.CLINIC_PHONE || "855-393-0900";
-    return twiml(res, `Thanks — we received your message.\n\n${footer(clinicName, clinicPhone)}`);
+    return twiml(res, demoRefusal(clinicName, clinicPhone));
   }
 }
 
-function menuText(clinicName, clinicPhone, noticeHours) {
+function menuText(clinicName, clinicPhone) {
   return (
     `Sorry we missed you.\n\n` +
     `Reply:\n` +
-    `1 = Book new patient exam\n` +
-    `2 = Reschedule / change appointment (${noticeHours}h notice)\n` +
-    `3 = Other\n\n` +
+    `1 = Book a New Patient Exam\n\n` +
     `${footer(clinicName, clinicPhone)}`
   );
 }
 
-function parseMenuReply(msg) {
-  const s = String(msg || "").trim();
-  const firstChar = s[0];
-  if (!["1", "2", "3"].includes(firstChar)) return null;
+function demoRefusal(clinicName, clinicPhone) {
+  return (
+    `Since I am the demo version I cannot be able to do that.\n` +
+    `I can help you book a New Patient Exam or answer basic clinic questions.\n\n` +
+    `${footer(clinicName, clinicPhone)}`
+  );
+}
 
-  const prefixRegex = new RegExp(`^\\s*${firstChar}\\s*([\\-:])?\\s*`, "i");
+// Accept "1" or "1 - ..." or "1: ..."
+function parseOneOnly(msg) {
+  const s = String(msg || "").trim();
+  if (!s) return null;
+  if (s[0] !== "1") return null;
+
+  const prefixRegex = new RegExp(`^\\s*1\\s*([\\-:])?\\s*`, "i");
   const details = s.replace(prefixRegex, "").trim();
-  return { choice: firstChar, details: details || "" };
+  return { details: details || "" };
 }
 
 function normalizeYesNo(msg) {
