@@ -1,4 +1,3 @@
-// api/cal-webhook.js
 import twilio from "twilio";
 
 function pick(obj, paths) {
@@ -29,7 +28,6 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
   try {
-    // Auth: token in URL query string
     const token = req.query?.token || req.query?.t || null;
 
     if (!process.env.CAL_WEBHOOK_SECRET) {
@@ -41,12 +39,11 @@ export default async function handler(req, res) {
 
     const body = req.body || {};
 
-    // Cal Ping/Test payloads often don't include booking fields.
-    // Treat these as a no-op and return 200 so the Cal "Ping test" shows success.
     const trigger = String(pick(body, ["triggerEvent", "event", "type"]) || "").toLowerCase();
     const hasPayload = !!body.payload;
+    const looksLikePing =
+      !hasPayload || trigger.includes("ping") || trigger.includes("test") || trigger.includes("webhook");
 
-    // Extract booking fields
     const fullName = pick(body, [
       "payload.attendees.0.name",
       "payload.booking.attendees.0.name",
@@ -64,17 +61,14 @@ export default async function handler(req, res) {
       "payload.responses.Phone",
       "payload.responses.Phone number",
       "payload.responses.phone_number",
-
       "payload.booking.responses.phone",
       "payload.booking.responses.phoneNumber",
       "payload.booking.responses.Phone",
       "payload.booking.responses.Phone number",
       "payload.booking.responses.phone_number",
-
       "payload.attendees.0.phoneNumber",
       "payload.attendee.phoneNumber",
       "payload.booking.attendees.0.phoneNumber",
-
       "payload.booker.phoneNumber",
       "payload.booking.booker.phoneNumber",
     ]);
@@ -88,7 +82,6 @@ export default async function handler(req, res) {
       "payload.start",
     ]);
 
-    // Pull timezone from payload if present; otherwise default to Toronto
     const tz =
       pick(body, [
         "payload.timeZone",
@@ -96,12 +89,6 @@ export default async function handler(req, res) {
         "payload.event.timeZone",
         "payload.booking.event.timeZone",
       ]) || "America/Toronto";
-
-    const looksLikePing =
-      !hasPayload ||
-      trigger.includes("ping") ||
-      trigger.includes("test") ||
-      trigger.includes("webhook");
 
     if (!fullName || !phone || !startTime) {
       if (looksLikePing) {
@@ -113,12 +100,9 @@ export default async function handler(req, res) {
         });
       }
 
-      // For real booking events, keep strict so you catch config issues
       return res.status(400).json({
         error: "Missing required fields from Cal payload",
         found: { fullName: !!fullName, phone: !!phone, startTime: !!startTime, tz },
-        hint:
-          "In Cal.com Event Type → Booking questions, make Phone number REQUIRED so it appears in webhook payload.",
       });
     }
 
@@ -127,7 +111,6 @@ export default async function handler(req, res) {
     const clinicName = process.env.CLINIC_NAME || "Huron Dental Centre";
     const clinicPhone = process.env.CLINIC_PHONE || "855-393-0900";
 
-    // Consistent SMS format + explicit timezone to avoid confusion
     const smsBody =
       `Hello, We look forward to seeing ${fullName} on ${date}, at ${time} (${tz}).\n` +
       `Please confirm your presence by replying YES or NO.\n\n` +
@@ -137,18 +120,10 @@ export default async function handler(req, res) {
     const { TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER } = process.env;
 
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_FROM_NUMBER) {
-      return res.status(500).json({
-        error: "Missing Twilio env vars",
-        missing: {
-          TWILIO_ACCOUNT_SID: !TWILIO_ACCOUNT_SID,
-          TWILIO_AUTH_TOKEN: !TWILIO_AUTH_TOKEN,
-          TWILIO_FROM_NUMBER: !TWILIO_FROM_NUMBER,
-        },
-      });
+      return res.status(500).json({ error: "Missing Twilio env vars" });
     }
 
     const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
-
     const msg = await client.messages.create({
       to: String(phone).trim(),
       from: TWILIO_FROM_NUMBER,
@@ -157,9 +132,6 @@ export default async function handler(req, res) {
 
     return res.status(200).json({ ok: true, sent: true, sid: msg.sid });
   } catch (err) {
-    return res.status(500).json({
-      error: "Server error",
-      detail: err?.message || String(err),
-    });
+    return res.status(500).json({ error: "Server error", detail: err?.message || String(err) });
   }
 }
