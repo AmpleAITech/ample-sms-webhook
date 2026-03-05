@@ -1,76 +1,98 @@
+// api/bestcare-sms.js
+// Twilio inbound SMS webhook (POST, x-www-form-urlencoded).
+// BULLETPROOF DEMO MODE (NEW PATIENT ONLY):
+// - YES/NO works for confirmation texts
+// - "1" starts a New Patient request flow
+// - Next SMS from same number within 10 min is treated as "details" and we reply:
+//   "Thanks. Got it. We’ll confirm shortly."
+// - Anything else => demo refusal
+
+import { Redis } from "@upstash/redis";
+
+export const config = {
+  api: { bodyParser: false },
+};
+
+const redis = Redis.fromEnv();
+
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method not allowed");
 
-  try {
-    const body = req.body || {};
-    const from = String(body.From || "").trim();
-    const msgRaw = String(body.Body || "").trim();
+  const raw = await readRawBody(req);
+  const params = new URLSearchParams(raw);
 
-    const clinicName = process.env.CLINIC_NAME || "Huron Dental Centre";
-    const clinicPhone = process.env.CLINIC_PHONE || "855-393-0900";
-    const bookingLink = process.env.CAL_BOOKING_LINK || ""; // optional fallback
+  const from = String(params.get("From") || "").trim();
+  const msgRaw = String(params.get("Body") || "").trim();
 
-    if (!from) return twiml(res, `Sorry — missing phone number.\n\n${footer(clinicName, clinicPhone)}`);
+  const clinicName = process.env.CLINIC_NAME || "Huron Dental Centre";
+  const clinicPhone = process.env.CLINIC_PHONE || "855-393-0900";
+  const bookingLink = process.env.CAL_BOOKING_LINK || "";
 
-    // Empty message -> send menu (1 only)
-    if (!msgRaw) return twiml(res, menuText(clinicName, clinicPhone));
+  if (!from) return twiml(res, `Sorry — missing phone number.\n\n${footer(clinicName, clinicPhone)}`);
 
-    // YES/NO confirmations for booking confirmation SMS
-    const yn = normalizeYesNo(msgRaw);
-    if (yn === "YES") {
-      return twiml(
-        res,
-        `Thanks for confirming.\nWe look forward to seeing you.\n\n${footer(clinicName, clinicPhone)}`
-      );
-    }
-    if (yn === "NO") {
-      return twiml(
-        res,
-        `No problem — we’ve noted you can’t make it.\nPlease call us if you need to reschedule.\n\n${footer(
-          clinicName,
-          clinicPhone
-        )}`
-      );
-    }
+  // Normalize message
+  const msg = msgRaw;
 
-    // NEW PATIENT ONLY: must start with "1"
-    const parsed = parseOneOnly(msgRaw);
-
-    // If NOT "1..." => refuse (bulletproof demo mode)
-    if (!parsed) {
-      return twiml(res, demoRefusal(clinicName, clinicPhone));
-    }
-
-    const details = parsed.details;
-
-    // If just "1" -> ask for name + preferred time
-    if (!details) {
-      const linkLine = bookingLink ? `\n\nOr book here:\n${bookingLink}` : "";
-      return twiml(
-        res,
-        `Please reply with: Full name + preferred day/time.\n\n` +
-          `Example: "Sarah Khan, Friday morning".` +
-          linkLine +
-          `\n\n${footer(clinicName, clinicPhone)}`
-      );
-    }
-
-    // If "1 - details" -> acknowledge (demo-safe)
-    return twiml(res, `Thanks. Got it. We’ll confirm shortly.\n\n${footer(clinicName, clinicPhone)}`);
-  } catch (_) {
-    const clinicName = process.env.CLINIC_NAME || "Huron Dental Centre";
-    const clinicPhone = process.env.CLINIC_PHONE || "855-393-0900";
-    return twiml(res, demoRefusal(clinicName, clinicPhone));
+  // YES/NO confirmations
+  const yn = normalizeYesNo(msg);
+  if (yn === "YES") {
+    return twiml(
+      res,
+      `Thanks for confirming.\nWe look forward to seeing you.\n\n${footer(clinicName, clinicPhone)}`
+    );
   }
+  if (yn === "NO") {
+    return twiml(
+      res,
+      `No problem — we’ve noted you can’t make it.\nPlease call us if you need to reschedule.\n\n${footer(
+        clinicName,
+        clinicPhone
+      )}`
+    );
+  }
+
+  // Check if this number is in "awaiting details" state
+  const stateKey = `sms:awaiting_details:${from}`;
+  const awaiting = await redis.get(stateKey);
+
+  // If they are in the details step, accept ANY text as details and acknowledge
+  if (awaiting) {
+    // Clear state immediately (prevents loops)
+    await redis.del(stateKey);
+
+    return twiml(res, `Thanks. Got it. We’ll confirm shortly.\n\n${footer(clinicName, clinicPhone)}`);
+  }
+
+  // Start flow ONLY if they text "1" (or "1 " etc.)
+  if (isOneOnly(msg)) {
+    // Set state for 10 minutes
+    await redis.set(stateKey, "1", { ex: 600 });
+
+    const linkLine = bookingLink ? `\n\nOr book here:\n${bookingLink}` : "";
+
+    return twiml(
+      res,
+      `Please reply with: Full name + preferred day/time.\n\n` +
+        `Example: "Sarah Khan, Friday morning".` +
+        linkLine +
+        `\n\n${footer(clinicName, clinicPhone)}`
+    );
+  }
+
+  // Anything else => demo refusal
+  return twiml(res, demoRefusal(clinicName, clinicPhone));
 }
 
-function menuText(clinicName, clinicPhone) {
-  return (
-    `Sorry we missed you.\n\n` +
-    `Reply:\n` +
-    `1 = Book a New Patient Exam\n\n` +
-    `${footer(clinicName, clinicPhone)}`
-  );
+function isOneOnly(msg) {
+  const s = String(msg || "").trim();
+  return s === "1";
+}
+
+function normalizeYesNo(msg) {
+  const s = String(msg || "").trim().toLowerCase();
+  if (s === "yes" || s === "y") return "YES";
+  if (s === "no" || s === "n") return "NO";
+  return "";
 }
 
 function demoRefusal(clinicName, clinicPhone) {
@@ -79,24 +101,6 @@ function demoRefusal(clinicName, clinicPhone) {
     `I can help you book a New Patient Exam or answer basic clinic questions.\n\n` +
     `${footer(clinicName, clinicPhone)}`
   );
-}
-
-// Accept "1" or "1 - ..." or "1: ..."
-function parseOneOnly(msg) {
-  const s = String(msg || "").trim();
-  if (!s) return null;
-  if (s[0] !== "1") return null;
-
-  const prefixRegex = new RegExp(`^\\s*1\\s*([\\-:])?\\s*`, "i");
-  const details = s.replace(prefixRegex, "").trim();
-  return { details: details || "" };
-}
-
-function normalizeYesNo(msg) {
-  const s = String(msg || "").trim().toLowerCase();
-  if (s === "yes" || s === "y") return "YES";
-  if (s === "no" || s === "n") return "NO";
-  return "";
 }
 
 function footer(clinicName, clinicPhone) {
@@ -120,4 +124,13 @@ function escapeXml(str) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&apos;");
+}
+
+async function readRawBody(req) {
+  return await new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (chunk) => (data += chunk));
+    req.on("end", () => resolve(data));
+    req.on("error", reject);
+  });
 }
