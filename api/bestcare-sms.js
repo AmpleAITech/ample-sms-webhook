@@ -1,12 +1,3 @@
-// api/bestcare-sms.js
-// Twilio inbound SMS webhook (POST, x-www-form-urlencoded).
-// BULLETPROOF DEMO MODE:
-// - Accepts only:
-//    * YES/NO (confirmation replies)
-//    * "1" (new patient exam request) optionally with details: "1 - John Smith, Fri morning"
-// - Anything else => demo refusal message
-// - Consistent footer
-
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method not allowed");
 
@@ -17,11 +8,11 @@ export default async function handler(req, res) {
 
     const clinicName = process.env.CLINIC_NAME || "Huron Dental Centre";
     const clinicPhone = process.env.CLINIC_PHONE || "855-393-0900";
-    const bookingLink = process.env.CAL_BOOKING_LINK || ""; // optional
+    const bookingLink = process.env.CAL_BOOKING_LINK || ""; // optional fallback
 
     if (!from) return twiml(res, `Sorry — missing phone number.\n\n${footer(clinicName, clinicPhone)}`);
 
-    // Empty message -> send menu
+    // Empty message -> send menu (1 only)
     if (!msgRaw) return twiml(res, menuText(clinicName, clinicPhone));
 
     // YES/NO confirmations for booking confirmation SMS
@@ -35,7 +26,7 @@ export default async function handler(req, res) {
     if (yn === "NO") {
       return twiml(
         res,
-        `No problem — we’ve noted you can’t make it.\nPlease call us to reschedule.\n\n${footer(
+        `No problem — we’ve noted you can’t make it.\nPlease call us if you need to reschedule.\n\n${footer(
           clinicName,
           clinicPhone
         )}`
@@ -45,14 +36,14 @@ export default async function handler(req, res) {
     // NEW PATIENT ONLY: must start with "1"
     const parsed = parseOneOnly(msgRaw);
 
-    // If message is NOT "1..." => refuse
+    // If NOT "1..." => refuse (bulletproof demo mode)
     if (!parsed) {
       return twiml(res, demoRefusal(clinicName, clinicPhone));
     }
 
     const details = parsed.details;
 
-    // If they just sent "1" -> ask for details
+    // If just "1" -> ask for name + preferred time
     if (!details) {
       const linkLine = bookingLink ? `\n\nOr book here:\n${bookingLink}` : "";
       return twiml(
@@ -64,7 +55,7 @@ export default async function handler(req, res) {
       );
     }
 
-    // If they sent "1 - details" -> acknowledge (demo capture)
+    // If "1 - details" -> acknowledge (demo-safe)
     return twiml(res, `Thanks. Got it. We’ll confirm shortly.\n\n${footer(clinicName, clinicPhone)}`);
   } catch (_) {
     const clinicName = process.env.CLINIC_NAME || "Huron Dental Centre";
@@ -84,7 +75,7 @@ function menuText(clinicName, clinicPhone) {
 
 function demoRefusal(clinicName, clinicPhone) {
   return (
-    `Since I am the demo version I cannot be able to do that.\n` +
+    `Since I am the demo version I cannot be able to do that. ` +
     `I can help you book a New Patient Exam or answer basic clinic questions.\n\n` +
     `${footer(clinicName, clinicPhone)}`
   );
